@@ -43,7 +43,7 @@ export const TEXT = {
       "How can I partner with the Population Council?",
       "What career opportunities or fellowships are available?"
     ],
-    CHAT_HEADER_TITLE: "Population Council Chatbot",
+    CHAT_HEADER_TITLE: "Population Council Research Assistant",
     CHAT_INPUT_PLACEHOLDER: "Type a Query...",
     HELPER_TEXT: "Cannot send empty message",
     SPEECH_RECOGNITION_START: "Start Listening",
