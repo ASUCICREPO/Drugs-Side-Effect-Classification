@@ -93,7 +93,17 @@ function SearchHistory() {
 
   return (
     <div>
-      <Accordion defaultExpanded sx={{ borderRadius: '4px', overflow: 'hidden' }}>
+      <Accordion 
+        defaultExpanded 
+        sx={{ 
+          backgroundColor: '#003A5D', // Set the background for the entire Accordion
+          borderRadius: '4px',
+          '&:before': {
+            display: 'none', // Remove the default divider
+          },
+          boxShadow: 'none' // Remove default shadows
+        }}
+      >
         <AccordionSummary
           expandIcon={<ExpandMoreIcon sx={{ color: "#FFFFFF" }} />}
           aria-controls="search-history-content"
@@ -102,7 +112,6 @@ function SearchHistory() {
             padding: '0 8px',
             minHeight: '48px',
             backgroundColor: '#003A5D',
-            borderRadius: '4px',
             "& .MuiAccordionSummary-content": {
               margin: 0 // Ensures there is no extra margin that could cause overflow
             }
@@ -111,7 +120,10 @@ function SearchHistory() {
           <Typography variant="h6" sx={{ fontWeight: 'bold', color: "#FFFFFF" }}>Search History</Typography>
           <Tooltip title={deleted ? "Deleted" : "Delete Search History"} arrow>
             <IconButton 
-              onClick={handleDeleteHistory} 
+              onClick={(e) => {
+                e.stopPropagation(); // Prevent accordion from toggling
+                handleDeleteHistory(); 
+              }}
               sx={{ 
                 marginLeft: 'auto', 
                 color: deleted ? "#4caf50" : "#FFFFFF", 
@@ -126,7 +138,6 @@ function SearchHistory() {
           sx={{ 
             padding: '16px', 
             backgroundColor: '#003A5D', 
-            borderRadius: '4px',
             maxHeight: { xs: '150px', sm: '200px', md: '250px', lg: '300px' }, 
             overflowY: 'auto', 
             overflowX: 'hidden' // Remove horizontal overflow to prevent triangle artifacts

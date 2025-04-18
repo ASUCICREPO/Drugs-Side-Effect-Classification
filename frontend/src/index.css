@@ -82,8 +82,9 @@ code {
 .appHeight100 {
   height: 100%;
 }
+
 .appFixedHeight100 {
-  height: calc(100vh - 5rem);
+  height: calc(100vh - 5rem) !important; /* Use !important to override any conflicting styles */
 }
 
 .appHeightInherit {

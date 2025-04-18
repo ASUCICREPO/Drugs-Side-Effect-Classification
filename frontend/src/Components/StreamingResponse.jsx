@@ -1,221 +1,202 @@
-// StreamingMessage.js
+// /home/zvallarino/AI_AWS_PC/Drugs-Side-Effect-Classification/frontend/src/Components/StreamingResponse.jsx
+
 import React, { useState, useEffect, useRef } from "react";
-import { Grid, Avatar, Typography, List, ListItem, Link, IconButton, Tooltip } from "@mui/material";
+import { Grid, Avatar, Typography, IconButton, Tooltip, Box } from "@mui/material";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 import CheckIcon from "@mui/icons-material/Check";
 import BotAvatar from "../Assets/BotAvatar.svg";
-import LoadingAnimation from "../Assets/loading_animation.gif"; // Import the loading animation
-import { ALLOW_CHAT_HISTORY, WEBSOCKET_API, ALLOW_MARKDOWN_BOT, DISPLAY_SOURCES_BEDROCK_KB, BOTMESSAGE_TEXT_COLOR } from "../utilities/constants";
-import { useMessage } from "../contexts/MessageContext";
-import createMessageBlock from "../utilities/createMessageBlock";
+import LoadingAnimation from "../Assets/loading_animation.gif";
+import { ALLOW_MARKDOWN_BOT, DISPLAY_SOURCES_BEDROCK_KB, BOTMESSAGE_TEXT_COLOR } from "../utilities/constants";
+// Removed useMessage import
 import ReactMarkdown from "react-markdown";
-import { useProcessing } from '../contexts/ProcessingContext';
 
-const StreamingMessage = ({ initialMessage }) => {
-  const [responses, setResponses] = useState([]);
-  const [showLoading, setShowLoading] = useState(true); // State to handle loading animation
-  const ws = useRef(null);
-  const messageBuffer = useRef("");
-  const { messageList, addMessage } = useMessage();
-  const [sources, setSources] = useState([]);
-  const [copySuccess, setCopySuccess] = useState(false);
-  const { processing, setProcessing } = useProcessing();
+const StreamingResponse = ({ websocket, onStreamComplete }) => {
+    const [currentStreamText, setCurrentStreamText] = useState("");
+    const [sources, setSources] = useState([]); // Still track sources if needed for live display (optional)
+    const [showLoading, setShowLoading] = useState(true);
+    const [copySuccess, setCopySuccess] = useState(false);
+    const isMounted = useRef(true); // Keep mount check
 
-  useEffect(() => {
-    ws.current = new WebSocket(WEBSOCKET_API);
+    useEffect(() => {
+        isMounted.current = true;
+        return () => {
+            isMounted.current = false;
+        };
+    }, []);
 
-    ws.current.onopen = () => {
-      console.log("WebSocket Connected");
-      ws.current.send(
-        JSON.stringify({
-          action: "sendMessage",
-          prompt: initialMessage,
-          history: ALLOW_CHAT_HISTORY ? messageList : [],
-        })
-      );
-      console.log("Initial message sent to bot");
-      console.log("Message list: ", messageList);
-    };
 
-    ws.current.onmessage = (event) => {
-      try {
-        messageBuffer.current += event.data;
-        const parsedData = JSON.parse(messageBuffer.current);
-
-        if (parsedData.type === "end") {
-          setProcessing(false);
-          console.log("End of conversation");
+    useEffect(() => {
+        if (!websocket || websocket.readyState !== WebSocket.OPEN) {
+            console.warn("StreamingResponse: WebSocket instance not available or not open.");
+            // Signal completion immediately with error state if WS is bad
+            if (onStreamComplete) {
+                onStreamComplete("", [], true); // Pass empty text/sources, indicate error
+            }
+            return;
         }
 
-        if (parsedData.type === "delta") {
-          setResponses((prev) => [...prev, parsedData.text]);
+        console.log("StreamingResponse: Attaching listeners to WebSocket.");
+        setCurrentStreamText("");
+        setSources([]);
+        setShowLoading(true);
+        setCopySuccess(false);
 
-          // Hide the loading animation once the first response hits
-          if (showLoading) {
+        let accumulatedText = "";
+        let accumulatedSources = []; // Accumulate sources locally too
+
+        const handleWebSocketMessage = (event) => {
+             if (!isMounted.current) {
+                console.log("StreamingResponse: Component unmounted, ignoring WS message.");
+                return;
+            }
+
+            let jsonData = null;
+            try {
+                jsonData = JSON.parse(event.data);
+
+                if ((jsonData.type === "delta" || jsonData.type === "text") && jsonData.text) {
+                    if (showLoading) setShowLoading(false);
+                    accumulatedText += jsonData.text;
+                    setCurrentStreamText(accumulatedText);
+                } else if (jsonData.type === "sources" && jsonData.sources) {
+                    console.log("StreamingResponse Sources received: ", jsonData.sources);
+                    // Optionally update state if you want to display sources live (uncommon)
+                    // setSources(jsonData.sources);
+                    accumulatedSources = jsonData.sources; // Store for final callback
+                } else if (jsonData.type === "end" || jsonData.type === "error") {
+                    const isError = jsonData.type === "error";
+                    const errorMsg = isError ? jsonData.text : null;
+                    console.log(`StreamingResponse ${isError ? 'Error' : 'End'} signal received.`);
+
+                    // Call completion callback with final data
+                    if (onStreamComplete) {
+                        console.log("StreamingResponse: Signaling stream completion with final data.");
+                        // Pass accumulated text/sources, and error flag
+                        onStreamComplete(accumulatedText, accumulatedSources, isError, errorMsg);
+                    }
+                    // DO NOT add message block here anymore
+                    // DO NOT set processing false here
+
+                } else {
+                    console.warn("StreamingResponse Received unknown message type:", jsonData.type, jsonData);
+                }
+
+            } catch (e) {
+                 console.error("StreamingResponse: Error parsing WebSocket message.", e, "Data:", event.data);
+                 // Signal completion with error if parsing fails critically
+                 if (onStreamComplete) {
+                     onStreamComplete(accumulatedText, accumulatedSources, true, "Error parsing response.");
+                 }
+            }
+        };
+
+        const handleWebSocketError = (error) => {
+            if (!isMounted.current) return;
+            console.error("StreamingResponse WebSocket Error: ", error);
             setShowLoading(false);
-          }
-        }
-        if (parsedData.type === "sources") {
-          setSources(parsedData.sources);
-          console.log("Sources received: ", parsedData.sources);
+             // Signal completion callback with error state
+            if (onStreamComplete) {
+                onStreamComplete(accumulatedText, accumulatedSources, true, "WebSocket connection error.");
+            }
+        };
 
-          const sourcesMessage = parsedData.sources
-            .map((source) => `${getFileNameFromUrl(source.url)} (Score: ${source.score}): ${source.url}`)
-            .join("\n");
+        const handleWebSocketClose = (event) => {
+            if (!isMounted.current) return;
+            setShowLoading(false);
+            console.log(`StreamingResponse WebSocket closed unexpectedly. Code: ${event.code}, Clean: ${event.wasClean}`);
+            // Signal completion callback with error state only if not already ended cleanly
+            // This requires more state tracking, for simplicity we'll signal potentially again,
+            // the parent should handle idempotency if needed.
+            if (onStreamComplete) {
+                // Pass current accumulated state and indicate error due to unclean close
+                 onStreamComplete(accumulatedText, accumulatedSources, true, `WebSocket closed unexpectedly (${event.code}).`);
+            }
+        };
 
-          const sourcesMessageBlock = createMessageBlock(
-            sourcesMessage,
-            "BOT",
-            "SOURCES",
-            "SENT"
-          );
+        websocket.onmessage = handleWebSocketMessage;
+        websocket.onerror = handleWebSocketError;
+        websocket.onclose = handleWebSocketClose;
 
-          addMessage(sourcesMessageBlock);
-          console.log("Sources message added to message list");
-          console.log("Message list with sources (hopefully): ", messageList);
-        }
+        return () => {
+            console.log("StreamingResponse: Detaching listeners.");
+            if (websocket) {
+                 if (websocket.onmessage === handleWebSocketMessage) websocket.onmessage = null;
+                 if (websocket.onerror === handleWebSocketError) websocket.onerror = null;
+                 if (websocket.onclose === handleWebSocketClose) websocket.onclose = null;
+            }
+        };
+    // Only depends on websocket instance and callback function identity
+    }, [websocket, onStreamComplete]);
 
-        messageBuffer.current = "";
-      } catch (e) {
-        if (e instanceof SyntaxError) {
-          console.log("Received incomplete JSON, waiting for more data...");
-        } else {
-          console.error("Error processing message: ", e);
-          messageBuffer.current = "";
-        }
-      }
+
+    const handleCopyToClipboard = () => {
+        // Now copies the live text state
+        if (!currentStreamText) return;
+        navigator.clipboard.writeText(currentStreamText).then(() => {
+            setCopySuccess(true);
+            setTimeout(() => setCopySuccess(false), 3000);
+        }).catch((err) => {
+            console.error("Failed to copy streaming message: ", err);
+        });
     };
 
-    ws.current.onerror = (error) => {
-      console.log("WebSocket Error: ", error);
-    };
-
-    ws.current.onclose = (event) => {
-      if (event.wasClean) {
-        console.log(
-          `WebSocket closed cleanly, code=${event.code}, reason=${event.reason}`
+    // --- Render Logic ---
+     if (showLoading) { // Show loading initially
+         return ( /* ... loading indicator JSX ... */
+            <Box sx={{ width: '100%' }}>
+                <Grid container direction="row" justifyContent="flex-start" alignItems="flex-start" spacing={1} wrap="nowrap">
+                    <Grid item><Avatar alt="Bot Avatar" src={BotAvatar} sx={{ width: 40, height: 40, mt: 1 }} /></Grid>
+                    <Grid item className="botMessage" xs sx={{ /* styles */ backgroundColor: (theme) => theme.palette.background.botMessage, position: "relative", padding: '10px 15px', borderRadius: '20px', mt: 1, minWidth: '50px', maxWidth: 'calc(100% - 50px)', wordWrap: 'break-word', minHeight: '40px' }}>
+                        <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100%', minHeight: 'inherit' }}>
+                            <img src={LoadingAnimation} alt="Loading..." style={{ width: '40px', height: '40px' }} />
+                        </Box>
+                    </Grid>
+                </Grid>
+            </Box>
         );
-      } else {
-        console.log("WebSocket Disconnected unexpectedly");
-      }
-    };
-
-    return () => {
-      if (ws.current) {
-        ws.current.close();
-      }
-    };
-  }, [initialMessage, setProcessing]);
-
-  useEffect(() => {
-    if (!processing) {
-      const finalMessage = responses.join("");
-      const botMessageBlock = createMessageBlock(
-        finalMessage,
-        "BOT",
-        "TEXT",
-        "SENT"
-      );
-      addMessage(botMessageBlock);
-      console.log("Bot message added to message list");
-      console.log("Message list: ", messageList);
     }
-  }, [processing]);
 
-  const getFileNameFromUrl = (url) => {
-    return url.substring(url.lastIndexOf("/") + 1);
-  };
+    // Only render the box if there's actually text being streamed.
+    // The final persistent message will be rendered by BotReply in ChatBody.
+    if (!currentStreamText) {
+        return null; // Don't render an empty box while waiting for the first delta
+    }
 
-  const handleCopyToClipboard = () => {
-    const textToCopy = `${responses.join("")}${sources.length > 0 ? "\n\nSources:\n" + sources.map((source) => `${getFileNameFromUrl(source.url)} (Score: ${source.score}): ${source.url}`).join("\n") : ""}`;
-    navigator.clipboard.writeText(textToCopy).then(() => {
-      console.log("Message copied to clipboard");
-      setCopySuccess(true);
-      setTimeout(() => setCopySuccess(false), 3000);
-    }).catch((err) => {
-      console.error("Failed to copy: ", err);
-    });
-  };
+    // If loading is finished but there's no text yet (and sources haven't arrived), render nothing temporarily
+    // This prevents an empty box flashing briefly before text arrives.
+    // We rely on the final message block being added by the 'end'/'error' handler.
+    if (!showLoading && !currentStreamText && sources.length === 0) {
+        // Or, you could potentially keep the loading indicator until the *first* delta or 'end'/'error' if preferred.
+        // For now, rendering null once loading is false but text hasn't arrived.
+        return null;
+    }
 
-  return (
-    <>
-      {/* Primary message container */}
-      <Grid container direction="row" justifyContent="flex-start" alignItems="flex-end">
-        <Grid item>
-          <Avatar
-            alt="Bot Avatar"
-            src={BotAvatar}
-            sx={{
-              width: 40,
-              height: 40,
-              '& .MuiAvatar-img': {
-                objectFit: 'contain',
-                p: 1,
-              },
-            }}
-          />
-        </Grid>
-    
-        <Grid
-          item
-          className="botMessage"
-          mt={1}
-          sx={{
-            backgroundColor: (theme) => theme.palette.background.botMessage,
-            position: "relative",
-          }}
-        >
-          {!processing && (
-            <Tooltip title={copySuccess ? "Message copied" : "Copy message to clipboard"}>
-              <IconButton
-                size="small"
-                onClick={handleCopyToClipboard}
-                sx={{ position: "absolute", top: 0, right: 0 }}
-              >
-                {copySuccess ? <CheckIcon fontSize="small" /> : <ContentCopyIcon fontSize="small" />}
-              </IconButton>
-            </Tooltip>
-          )}
-          {processing ? (
-            showLoading ? (
-              <img src={LoadingAnimation} alt="Loading..." style={{ width: '50px', marginTop: '10px' }} />
-            ) : (
-              ALLOW_MARKDOWN_BOT ? (
-                <Typography variant="body2" component="div" color={BOTMESSAGE_TEXT_COLOR}>
-                  <ReactMarkdown>{responses.join("")}</ReactMarkdown>
-                </Typography>
-              ) : (
-                <Typography variant="body2" component="div" color={BOTMESSAGE_TEXT_COLOR}>
-                  {responses.join("")}
-                </Typography>
-              )
-            )
-          ) : (
-            ALLOW_MARKDOWN_BOT ? (
-              <Typography variant="body2" component="div" color={BOTMESSAGE_TEXT_COLOR}>
-                <ReactMarkdown>{responses.join("")}</ReactMarkdown>
-              </Typography>
-            ) : (
-              <Typography variant="body2" component="div" color={BOTMESSAGE_TEXT_COLOR}>
-                {responses.join("")}
-              </Typography>
-            )
-          )}
-          {DISPLAY_SOURCES_BEDROCK_KB && sources.length > 0 && (
-            <List sx={{ mt: 2 }}>
-              {sources.map((source, index) => (
-                <ListItem key={index}>
-                  <Link href={`${source.url}#page=${source.page}`} target="_blank" rel="noopener">
-                    {getFileNameFromUrl(source.url)} (Score: {source.score.toFixed(2)})
-                  </Link>
-                </ListItem>
-              ))}
-            </List>
-          )}
-        </Grid>
-      </Grid>
-    </>
-  );
-};
 
-export default StreamingMessage;
+    // Render the streaming text as it arrives
+    return ( /* ... JSX to display currentStreamText with copy button ... */
+        <Box sx={{ width: '100%' }}>
+            <Grid container direction="row" justifyContent="flex-start" alignItems="flex-start" spacing={1} wrap="nowrap">
+                 <Grid item><Avatar alt="Bot Avatar" src={BotAvatar} sx={{ width: 40, height: 40, mt: 1 }} /></Grid>
+                 <Grid item className="botMessage" xs sx={{ /* styles */ backgroundColor: (theme) => theme.palette.background.botMessage, position: "relative", padding: '10px 15px', paddingRight: '40px', borderRadius: '20px', mt: 1, minWidth: '50px', maxWidth: 'calc(100% - 50px)', wordWrap: 'break-word', minHeight: '40px' }}>
+                    {currentStreamText && (
+                         <Tooltip title={copySuccess ? "Copied" : "Copy current text"}>
+                              <IconButton size="small" onClick={handleCopyToClipboard} sx={{ position: "absolute", top: 5, right: 5, zIndex: 1, color: 'grey.600' }}>
+                                  {copySuccess ? <CheckIcon fontSize="small" /> : <ContentCopyIcon fontSize="small" />}
+                              </IconButton>
+                          </Tooltip>
+                     )}
+                      {ALLOW_MARKDOWN_BOT ? (
+                         <Typography variant="body2" component="div" color={BOTMESSAGE_TEXT_COLOR} sx={{ '& > p': { margin: 0 } }}>
+                             <ReactMarkdown>{currentStreamText || "\u00A0"}</ReactMarkdown>
+                          </Typography>
+                      ) : (
+                         <Typography variant="body2" component="div" color={BOTMESSAGE_TEXT_COLOR}>
+                              {currentStreamText || "\u00A0"}
+                          </Typography>
+                      )}
+                 </Grid>
+             </Grid>
+        </Box>
+     );
+ };
+export default StreamingResponse;

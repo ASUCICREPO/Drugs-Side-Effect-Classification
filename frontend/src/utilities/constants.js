@@ -7,7 +7,7 @@ export const primary_50 = "#6BC049"; // The 50 variant of the primary color
 export const SECONDARY_MAIN = "#D3D3D3"; // The main secondary color used for less prominent elements
 
 // Chat component background colors
-export const CHAT_BODY_BACKGROUND = "#FFFFFF"; // Background color for the chat body area
+export const CHAT_BODY_BACKGROUND = "##003300"; // Background color for the chat body area
 export const CHAT_LEFT_PANEL_BACKGROUND = "#003A5D"; // Background color for the left panel in the chat
 export const ABOUT_US_HEADER_BACKGROUND = "#FFFFFF"; // Background color for the About Us section in the left panel
 export const FAQ_HEADER_BACKGROUND = "#FFFFFF"; // Background color for the FAQ section in the left panel
@@ -44,7 +44,7 @@ export const TEXT = {
       "What career opportunities or fellowships are available?"
     ],
     CHAT_HEADER_TITLE: "Population Council Research Assistant",
-    CHAT_INPUT_PLACEHOLDER: "Type a Query...",
+    CHAT_INPUT_PLACEHOLDER: "Type a question...",
     HELPER_TEXT: "Cannot send empty message",
     SPEECH_RECOGNITION_START: "Start Listening",
     SPEECH_RECOGNITION_STOP: "Stop Listening",
