@@ -5,14 +5,35 @@ import ReactMarkdown from 'react-markdown';
 import { ALLOW_MARKDOWN_BOT, BOTMESSAGE_TEXT_COLOR, DISPLAY_SOURCES_BEDROCK_KB } from '../utilities/constants'; // Assuming BOTMESSAGE_BACKGROUND might be needed via sx
 
 // Helper to get filename (copied from StreamingResponse)
+// --- >>> Make sure this improved helper function is at the top <<< ---
 const getFileNameFromUrl = (url = '') => {
-    try {
-        return url.substring(url.lastIndexOf('/') + 1);
-    } catch (e) {
-        console.error("Error getting filename from URL:", url, e);
-        return 'source'; // Fallback name
-    }
+  if (!url) return 'source';
+  try {
+      // 1. Find the last '/'
+      const lastSlashIndex = url.lastIndexOf('/');
+      let fileNameWithQuery = url.substring(lastSlashIndex + 1);
+
+      // 2. Find the first '?' (start of query params)
+      const queryIndex = fileNameWithQuery.indexOf('?');
+
+      // 3. Take the part before the '?' if it exists
+      let fileNameOnly = (queryIndex !== -1) ? fileNameWithQuery.substring(0, queryIndex) : fileNameWithQuery;
+
+      // 4. Decode URL-encoded characters (e.g., %20 -> space)
+      return decodeURIComponent(fileNameOnly);
+  } catch (e) {
+      console.error("Error getting clean filename from URL:", url, e);
+      // Fallback: return the part after the last slash, before query params if possible
+      try {
+           let fallback = url.substring(url.lastIndexOf('/') + 1);
+           const queryIndex = fallback.indexOf('?');
+           return (queryIndex !== -1) ? fallback.substring(0, queryIndex) : fallback;
+      } catch {
+          return 'source'; // Final fallback
+      }
+  }
 };
+// --- >>> End Helper Function <<< ---
 
 function BotReply({ message, sources }) {
   // Basic display, maybe use ReactMarkdown, handle sources link display etc.

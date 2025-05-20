@@ -7,7 +7,7 @@ export const primary_50 = "#6BC049"; // The 50 variant of the primary color
 export const SECONDARY_MAIN = "#D3D3D3"; // The main secondary color used for less prominent elements
 
 // Chat component background colors
-export const CHAT_BODY_BACKGROUND = "##003300"; // Background color for the chat body area
+export const CHAT_BODY_BACKGROUND = "#FFFFFF"; // 003300 Background color for the chat body area
 export const CHAT_LEFT_PANEL_BACKGROUND = "#003A5D"; // Background color for the left panel in the chat
 export const ABOUT_US_HEADER_BACKGROUND = "#FFFFFF"; // Background color for the About Us section in the left panel
 export const FAQ_HEADER_BACKGROUND = "#FFFFFF"; // Background color for the FAQ section in the left panel
@@ -88,6 +88,7 @@ export const LANDING_PAGE_TEXT = {
     SAVE_CONTINUE: "Save and Continue",
     APP_ASSISTANT_NAME: "Sample GenAI Bot Landing Page",
     WELCOME_MESSAGE : "This chat is designed to help you access information about XYZ. You can ask questions about some FAQ and more!",
+    MORE_INFO_LINK_TEXT: "Click here for more info"
   },
   ES: {
     CHOOSE_LANGUAGE: "Elige el idioma:",
