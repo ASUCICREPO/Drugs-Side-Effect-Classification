@@ -1,50 +1,42 @@
+// src/Components/ChatHeader.jsx
 import React, { useState, useEffect } from "react";
-import Typography from "@mui/material/Typography";
-import { useLanguage } from "../contexts/LanguageContext"; // Adjust the import path
-import { TEXT, HEADER_TEXT_GRADIENT } from "../utilities/constants"; // Adjust the import path
-import { Container } from "@mui/material";
+import { Typography } from "@mui/material";
+import { useLanguage } from "../contexts/LanguageContext";
+import { TEXT } from "../utilities/constants";
 
 function ChatHeader({ selectedLanguage }) {
   const { language: contextLanguage } = useLanguage();
-  const language = selectedLanguage || contextLanguage || 'EN'; // Use selectedLanguage if provided, otherwise default to contextLanguage or 'EN'
+  const language = selectedLanguage || contextLanguage || "EN";
   const [isMobile, setIsMobile] = useState(false);
 
-  // Check if the screen is mobile size
   useEffect(() => {
-    const checkIsMobile = () => {
-      setIsMobile(window.innerWidth <= 768);
-    };
-    
-    // Set initial value
+    const checkIsMobile = () => setIsMobile(window.innerWidth <= 768);
     checkIsMobile();
-    
-    // Add event listener
-    window.addEventListener('resize', checkIsMobile);
-    
-    // Cleanup
-    return () => {
-      window.removeEventListener('resize', checkIsMobile);
-    };
+    window.addEventListener("resize", checkIsMobile);
+    return () => window.removeEventListener("resize", checkIsMobile);
   }, []);
 
-  // Don't render anything on mobile
-  if (isMobile) {
-    return null;
-  }
+  if (isMobile) return null;
 
   return (
-    <Container
+    <Typography
+      variant="h4"
+      className="chatHeaderText"
       sx={{
-        display: 'flex',
-        justifyContent: 'center',
-        alignItems: 'center',
-        height: '100%',
+        // zero footprint outside the text itself
+        m: 0,
+        p: 0,
+
+        // visuals
+        color: "#FFFFFF",
+        fontWeight: 400,
+        textAlign: "center",
+        fontSize: "clamp(18px, 2.6vw, 32px)",
+        lineHeight: 1.2,
       }}
     >
-      <Typography variant="h4" className="chatHeaderText" sx={{ background: HEADER_TEXT_GRADIENT, textAlign: 'center' }}>
-        {TEXT[language]?.CHAT_HEADER_TITLE || "Default Chat Header Title"} {/* Safe fallback */}
-      </Typography>
-    </Container>
+      {TEXT[language]?.CHAT_HEADER_TITLE || "Tobi"}
+    </Typography>
   );
 }
 

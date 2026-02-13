@@ -1,14 +1,37 @@
+// src/theme.js
 import { createTheme } from "@mui/material/styles";
-import { PRIMARY_MAIN, SECONDARY_MAIN, CHAT_BODY_BACKGROUND, CHAT_LEFT_PANEL_BACKGROUND, HEADER_BACKGROUND, USERMESSAGE_BACKGROUND, BOTMESSAGE_BACKGROUND, primary_50 } from "./utilities/constants";
+import {
+  PRIMARY_MAIN,
+  SECONDARY_MAIN,
+  CHAT_BODY_BACKGROUND,
+  CHAT_LEFT_PANEL_BACKGROUND,
+  HEADER_BACKGROUND,
+  USERMESSAGE_BACKGROUND,
+  BOTMESSAGE_BACKGROUND,
+  primary_50
+} from "./utilities/constants";
 
 const theme = createTheme({
   typography: {
-    fontFamily: 'Lato, -apple-system, BlinkMacSystemFont, "Segoe UI", "Roboto", "Oxygen", "Ubuntu", "Cantarell", "Fira Sans", "Droid Sans", "Helvetica Neue", sans-serif',
+    // Global font to Arial
+    fontFamily: 'Arial, Helvetica, sans-serif',
+    body1: {
+      fontSize: '16px',
+    },
+    body2: {
+      fontSize: '16px',
+    },
   },
+
   palette: {
     primary: {
       main: PRIMARY_MAIN,
       50: primary_50,
+    },
+    text: {
+      // Use hex (or rgb/hsl), not a named color
+      primary: '#5d5d5d',          // testing: main font color red
+      secondary: 'rgba(0,0,0,0.6)',
     },
     background: {
       default: CHAT_BODY_BACKGROUND,
@@ -20,6 +43,16 @@ const theme = createTheme({
     },
     secondary: {
       main: SECONDARY_MAIN,
+    },
+  },
+  components: {
+    MuiCssBaseline: {
+      styleOverrides: {
+        body: {
+          color: '#5d5d5d',        // also hex here for testing
+          fontFamily: 'Arial, Helvetica, sans-serif',
+        },
+      },
     },
   },
 });

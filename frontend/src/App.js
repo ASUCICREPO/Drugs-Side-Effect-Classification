@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect } from 'react'; 
 import theme from './theme'; // Import your theme
 import { ThemeProvider } from '@mui/material/styles'; 
 
@@ -19,6 +19,9 @@ import { ALLOW_LANDING_PAGE } from './utilities/constants';
 import { ALLOW_PDF_PREVIEW, ALLOW_VIDEO_PREVIEW } from './utilities/constants';
 import Box from '@mui/material/Box';
 
+// NEW: header background image
+import headerBg from './Assets/HeaderBackend.png';
+
 function MainApp() {
   const [showLeftNav, setLeftNav] = useState(true);
   const [uploadedFile, setUploadedFile] = useState(null);
@@ -27,19 +30,13 @@ function MainApp() {
 
   // Handle mobile viewport height (accounting for browser chrome)
   useEffect(() => {
-    // Function to update CSS variable with current viewport height
     const setAppHeight = () => {
       const vh = window.innerHeight * 0.01;
       document.documentElement.style.setProperty('--vh', `${vh}px`);
     };
-
-    // Set the height initially
     setAppHeight();
-
-    // Update height on resize and orientation change
     window.addEventListener('resize', setAppHeight);
     window.addEventListener('orientationchange', setAppHeight);
-
     return () => {
       window.removeEventListener('resize', setAppHeight);
       window.removeEventListener('orientationchange', setAppHeight);
@@ -51,25 +48,19 @@ function MainApp() {
     const checkIsMobile = () => {
       setIsMobile(window.innerWidth <= 768);
     };
-    
-    // Set initial value
     checkIsMobile();
-    
-    // Add event listener
     window.addEventListener('resize', checkIsMobile);
-    
-    // Cleanup
     return () => {
       window.removeEventListener('resize', checkIsMobile);
     };
   }, []);
 
-  // Auto-hide left nav on mobile
-  useEffect(() => {
-    if (isMobile) {
-      setLeftNav(false);
-    }
-  }, [isMobile]);
+  // // Auto-hide left nav on mobile
+  // useEffect(() => {
+  //   if (isMobile) {
+  //     setLeftNav(false);
+  //   }
+  // }, [isMobile]);
 
   const handleFileUploadComplete = (file, fileStatus) => {
     setUploadedFile(file);
@@ -86,8 +77,8 @@ function MainApp() {
   return (
     <Box 
       sx={{ 
-        height: '100vh', // Fallback
-        height: 'calc(var(--vh, 1vh) * 100)', // Mobile-friendly height
+        height: '100vh',
+        height: 'calc(var(--vh, 1vh) * 100)',
         display: 'flex',
         flexDirection: 'column',
         margin: 0,
@@ -95,49 +86,39 @@ function MainApp() {
         overflow: 'hidden'
       }}
     >
-      {/* Header */}
-      <Box sx={{ flexShrink: 0 }}>
+      {/* Header with background image */}
+      <Box 
+      sx={{
+    /* Never smaller than 80px, never larger than 148px, scales with viewport */
+    height: 'clamp(80px, 12vh, 148px)',
+    position: 'relative',
+    backgroundImage: `url(${headerBg})`,
+    backgroundSize: 'cover',
+    backgroundPosition: 'center',
+    backgroundRepeat: 'no-repeat',
+  }}
+      > 
         <AppHeader showSwitch={true} />
       </Box>
       
       {/* Main Content Area */}
       <Box 
         sx={{ 
+          height: '80%',
           flexGrow: 1,
           display: 'flex',
           overflow: 'hidden',
           backgroundColor: isMobile ? 'inherit' : 'inherit',
-          minHeight: 0 // This is critical for flexbox to work properly
+          minHeight: 0
         }}
       >
-        {/* Left Navigation */}
-        {(showLeftNav || !isMobile) && (
-          <Box 
-            sx={{ 
-              width: showLeftNav ? (isMobile ? '100%' : `${(leftNavSize/12)*100}%`) : '40px',
-              position: isMobile ? 'absolute' : 'relative',
-              zIndex: isMobile ? 1100 : 1,
-              display: isMobile && !showLeftNav ? 'none' : 'block',
-              height: '100%',
-              overflow: 'hidden'
-            }}
-          >
-            <LeftNav 
-              showLeftNav={showLeftNav} 
-              setLeftNav={setLeftNav} 
-              uploadedFile={uploadedFile} 
-              fileType={fileType} 
-            />
-          </Box>
-        )}
-        
+  
         {/* Chat Area */}
         <Box 
           sx={{
             flexGrow: 1,
-            height: '100%', 
-            // padding: { xs: '1.5rem', md: '1.5rem 5%', lg: '1.5rem 10%', xl: '1.5rem 10%' },
-            paddingBottom: 0, // Remove bottom padding
+            height: '100%',
+            paddingBottom: 0,
             backgroundColor: (theme) => theme.palette.background.chatBody,
             visibility: isMobile && showLeftNav ? 'hidden' : 'visible',
             display: 'flex',
@@ -150,7 +131,8 @@ function MainApp() {
               <ChatHeader onFileUpload={handleFileUploadComplete} />
             </Box>
           )}
-          
+
+          {/* Spacer between header and first message is handled inside ChatBody for easy editing */}
           <Box sx={{ flexGrow: 1, overflow: 'hidden' }}>
             <ChatBody 
               onFileUpload={handleFileUploadComplete} 
@@ -170,23 +152,21 @@ function App() {
 
   return (
     <LanguageProvider>
-        <TranscriptProvider>
-          <QuestionProvider>
-            <MessageProvider>
-              <ProcessingProvider>
-                <RoleProvider> {/* *** WRAP HERE *** */}
-                  <ThemeProvider theme={theme}>
-                    {!languageSet && ALLOW_LANDING_PAGE ? <LandingPage /> : <MainApp />}
-                  </ThemeProvider>
-                </RoleProvider> {/* *** END WRAP *** */}
-              </ProcessingProvider>
-            </MessageProvider>
-          </QuestionProvider>
-        </TranscriptProvider>
-      </LanguageProvider>
+      <TranscriptProvider>
+        <QuestionProvider>
+          <MessageProvider>
+            <ProcessingProvider>
+              <RoleProvider>
+                <ThemeProvider theme={theme}>
+                  {!languageSet && ALLOW_LANDING_PAGE ? <LandingPage /> : <MainApp />}
+                </ThemeProvider>
+              </RoleProvider>
+            </ProcessingProvider>
+          </MessageProvider>
+        </QuestionProvider>
+      </TranscriptProvider>
+    </LanguageProvider>
   );
 }
 
 export default App;
-
-
