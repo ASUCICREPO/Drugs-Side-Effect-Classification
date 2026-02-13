@@ -1,3 +1,5 @@
+//cdk_backend-stack.ts
+
 import * as cdk from 'aws-cdk-lib';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as apigatewayv2 from '@aws-cdk/aws-apigatewayv2-alpha';
@@ -87,11 +89,13 @@ export class CdkBackendStack extends cdk.Stack {
       ],
       resources: [
         `arn:aws:bedrock:${this.region}:${this.account}:knowledge-base/${kb.knowledgeBaseId}`,
+        
         `arn:aws:bedrock:${this.region}::foundation-model/anthropic.claude-3-5-sonnet-20240620-v1:0`,
         `arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-3-5-sonnet-20240620-v2:0`,
         `arn:aws:bedrock:${this.region}:${this.account}:agent-runtime/*`,
         `arn:aws:bedrock:${this.region}:${this.account}:*`,
         `arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-3-5-sonnet-20241022-v2:0`,
+        
         webSocketApiArn
       ]
     }));
