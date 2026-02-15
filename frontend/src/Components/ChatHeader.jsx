@@ -42,7 +42,7 @@ function ChatHeader({ selectedLanguage }) {
       }}
     >
       <Typography variant="h4" className="chatHeaderText" sx={{ background: HEADER_TEXT_GRADIENT, textAlign: 'center' }}>
-        {TEXT[language]?.CHAT_HEADER_TITLE || "Default Chat Header Title"} {/* Safe fallback */}
+        {/* {TEXT[language]?.CHAT_HEADER_TITLE || "Default Chat Header Title"} Safe fallback */}
       </Typography>
     </Container>
   );

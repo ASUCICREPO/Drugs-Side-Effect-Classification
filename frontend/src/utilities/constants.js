@@ -1,19 +1,19 @@
 // --------------------------------------------------------------------------------------------------------//
 // Primary color constants for the theme
 export const PRIMARY_MAIN = "#003A5D"; // The main primary color used for buttons, highlights, etc.
-export const primary_50 = "#6BC049"; // The 50 variant of the primary color
+export const primary_50 = "#3366ff"; // The 50 variant of the primary color
 
 // Background color constants
-export const SECONDARY_MAIN = "#D3D3D3"; // The main secondary color used for less prominent elements
+export const SECONDARY_MAIN = "#03fc5a"; // The main secondary color used for less prominent elements
 
 // Chat component background colors
-export const CHAT_BODY_BACKGROUND = "##003300"; // Background color for the chat body area
+export const CHAT_BODY_BACKGROUND = "#FFFFFF"; // 003300 Background color for the chat body area
 export const CHAT_LEFT_PANEL_BACKGROUND = "#003A5D"; // Background color for the left panel in the chat
 export const ABOUT_US_HEADER_BACKGROUND = "#FFFFFF"; // Background color for the About Us section in the left panel
 export const FAQ_HEADER_BACKGROUND = "#FFFFFF"; // Background color for the FAQ section in the left panel
 export const ABOUT_US_TEXT = "#FFFFFF"; // Text color for the About Us section in the left panel
 export const FAQ_TEXT = "#FFFFFF"; // Text color for the FAQ section in the left panel
-export const HEADER_BACKGROUND = "#FFFFFF"; // Background color for the header
+export const HEADER_BACKGROUND = "#F6F6F6"; // Background color for the header
 export const HEADER_TEXT_GRADIENT = "linear-gradient(90deg, #003A5D, #6BC049)"; // Text gradient color for the header
 //D3D3D3
 // 6BC049
@@ -31,7 +31,7 @@ export const USERMESSAGE_TEXT_COLOR = "#FFFFFF"; // Text color for messages sent
 export const TEXT = {
   EN: {
     APP_NAME: "Population Council Chatbot",
-    APP_ASSISTANT_NAME: "Population Council Chatbot",
+    APP_ASSISTANT_NAME: "Tobi",
     ABOUT_US_TITLE: "About Us",
     ABOUT_US: "The Population Council is a leading research organization dedicated to building an equitable and sustainable world that enhances the health and well-being of current and future generations.",
     FILE_PREVIEW:"Uploaded File",
@@ -43,7 +43,7 @@ export const TEXT = {
       "How can I partner with the Population Council?",
       "What career opportunities or fellowships are available?"
     ],
-    CHAT_HEADER_TITLE: "Population Council Research Assistant",
+    CHAT_HEADER_TITLE: "Tobi",
     CHAT_INPUT_PLACEHOLDER: "Type a question...",
     HELPER_TEXT: "Cannot send empty message",
     SPEECH_RECOGNITION_START: "Start Listening",
@@ -88,6 +88,7 @@ export const LANDING_PAGE_TEXT = {
     SAVE_CONTINUE: "Save and Continue",
     APP_ASSISTANT_NAME: "Sample GenAI Bot Landing Page",
     WELCOME_MESSAGE : "This chat is designed to help you access information about XYZ. You can ask questions about some FAQ and more!",
+    MORE_INFO_LINK_TEXT: "Click here for more info"
   },
   ES: {
     CHOOSE_LANGUAGE: "Elige el idioma:",
