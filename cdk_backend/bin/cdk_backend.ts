@@ -3,6 +3,7 @@ import 'source-map-support/register';
 import * as cdk from 'aws-cdk-lib';
 import { CdkBackendStackInstanceA } from '../lib/cdk_backend-stack-instance-a';
 import { CdkBackendStackInstanceB } from '../lib/cdk_backend-stack-instance-b';
+import { CdkBackendStackInstanceC } from '../lib/cdk_backend-stack-instance-c';
 
 // Custom props interface imported explicitly
 interface CdkBackendStackProps extends cdk.StackProps {
@@ -25,6 +26,14 @@ new CdkBackendStackInstanceA(app, 'CdkBackendStack-InstanceA', {
 } as CdkBackendStackProps);
 
 new CdkBackendStackInstanceB(app, 'CdkBackendStack-InstanceB', {
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION,
+  },
+  githubToken,
+} as CdkBackendStackProps);
+
+new CdkBackendStackInstanceC(app, 'CdkBackendStack-InstanceC', {
   env: {
     account: process.env.CDK_DEFAULT_ACCOUNT,
     region: process.env.CDK_DEFAULT_REGION,

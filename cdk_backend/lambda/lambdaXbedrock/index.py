@@ -1,519 +1,965 @@
-# /home/zvallarino/AI_AWS_PC/Drugs-Side-Effect-Classification/cdk_backend/lambda/lambdaXbedrock/index.py
-
 import os
 import json
 import boto3
 import re
 import logging
-import datetime # <--- Added import for timestamp
-from botocore.exceptions import ClientError # Import ClientError for specific exception handling
+import urllib.parse
+from botocore.exceptions import ClientError
+from constants import load_from_env, REFERENCE_URLS
 
-# Configure logging
+# --- Optional OpenSearch imports (via your layer) ---
+try:
+    from opensearchpy import OpenSearch, RequestsHttpConnection, AWSV4SignerAuth
+    _OPENSEARCH_AVAILABLE = True
+except Exception:
+    _OPENSEARCH_AVAILABLE = False
+
+cfg = load_from_env()
+
+# ---------- Logging ----------
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+logger.info(f"Using model/profile id: {cfg.INFERENCE_PROFILE_ID or cfg.LLM_MODEL_FALLBACK_ID}")
+logger.info(
+    f"Using KB ID: {cfg.KNOWLEDGE_BASE_ID or '(none)'} | "
+    f"Bucket: {cfg.S3_BUCKET_NAME or '(none)'} | "
+    f"OS endpoint: {cfg.OPENSEARCH_ENDPOINT or '(none)'}"
+)
 
-# --- Constants (Keep existing SUPPORTED_COUNTRIES, BOT_PERSONAS, etc.) ---
-SUPPORTED_COUNTRIES = {
-    # ... keep your existing country set ...
-    "afghanistan", "algeria", "argentina", "armenia", "belarus", "belize", "benin",
-    "bosnia and herzegovina", "brazil", "burkina faso", "burundi", "cambodia",
-    "cameroon", "central africa republic", "colombia", "congo, dem. rep",
-    "costa rica", "côte d'ivoire", "china", "pakistan", "thailand", "ethiopia",
-    "mauritius", "djibouti", "dominica", "dominican republic", "el salvador",
-    "equatorial guinea", "gabon", "gambia", "georgia", "ghana", "grenada",
-    "guatemala", "guinea", "guinea-bissau", "india", "indonesia", "jamaica",
-    "kenya", "kiribati", "kosovo", "kyrgyz republic","Kyrgyzstan", "lebanon", "lesotho",
-    "liberia", "libya", "angola", "madagascar", "malawi", "malaysia", "maldives",
-    "mali", "marshall islands", "mexico", "micronesia", "moldova", "mongolia",
-    "montenegro", "morocco", "mozambique", "myanmar", "nepal", "nigeria",
-    "papua new guinea", "peru", "philippines", "rwanda", "samoa", "senegal",
-    "serbia", "sierra leone", "solomon islands", "somalia", "south africa",
-    "south sudan", "sri lanka", "st. lucia", "st. vincent and the grenadines",
-    "suriname", "tanzania", "lao pdr", "laos",
-    "timor-leste", "togo", "tunisia", "türkiye", "turkey",
-    "turkmenistan", "uganda", "ukraine", "bhutan", "bangladesh", "uzbekistan",
-    "vanuatu", "vietnam", "west bank and gaza", "zambia", "zimbabwe"
-}
+# ---------- AWS clients ----------
+brt = boto3.client("bedrock-runtime", region_name=cfg.REGION)
+agent_rt = boto3.client("bedrock-agent-runtime", region_name=cfg.REGION)
+ws = boto3.client("apigatewaymanagementapi", endpoint_url=cfg.WEBSOCKET_CALLBACK_URL) if cfg.WEBSOCKET_CALLBACK_URL else None
+s3 = boto3.client("s3") if cfg.S3_BUCKET_NAME else None
+MODEL_ID = cfg.INFERENCE_PROFILE_ID or cfg.LLM_MODEL_FALLBACK_ID
 
-BOT_PERSONAS = {
-    # ... keep your existing persona definitions ...
-    "researchAssistant": {
-        "name": "Ponyo",
-        "prompt": "You are Ponyo, a Research Assistant. Use the provided Knowledge Source Information ONLY to answer the user's question. If the information isn't sufficient to answer, clearly state that you don't have enough information based on the provided sources. Do not use prior knowledge. Be precise and stick strictly to the details found in the Knowledge Source."
-    },
-    "softwareEngineer": {
-        "name": "Chihiro",
-        "prompt": "You are Chihiro, a Software Engineer. Provide clear, concise, and technically accurate answers. You can explain concepts, provide code examples (if relevant and safe), and troubleshoot technical problems based on the context provided. Be helpful and efficient."
-    },
-    "genderYouthExpert": {
-        "name": "Kiki",
-        "prompt": "You are Kiki, a Gender and Youth Expert. Answer questions related to gender issues, youth development, and related social topics with sensitivity, expertise, and an informative tone. Ensure your responses are respectful, evidence-based (if sources are provided), and appropriate for discussions on these topics."
-    },
-    "default": { # Fallback persona
-        "name": "Assistant",
-        "prompt": "You are a helpful assistant."
+# ---------- Runtime JSON KBs ----------
+_RUNTIME_KB = None
+_PERSONAL_KB = None
+_RUNTIME_LAST_ETAG = None
+_PERSONAL_LAST_ETAG = None
+_CONFIG_LOADED = False
+
+def _get_env(name, default=""):
+    return getattr(cfg, name, None) or os.environ.get(name, default)
+
+def _get_s3_object_text(key):
+    """Read a small JSON file (runtime/personal) from S3."""
+    if not s3 or not _get_env("S3_BUCKET_NAME") or not key:
+        return "", None
+    try:
+        obj = s3.get_object(Bucket=_get_env("S3_BUCKET_NAME"), Key=key)
+        body = obj["Body"].read().decode("utf-8")
+        etag = (obj.get("ETag") or "").strip('"')
+        return body, (etag or None)
+    except Exception as e:
+        logger.error(f"Failed to read S3 object {key}: {e}")
+        return "", None
+
+def _load_runtime_kbs(force=False):
+    """Cold-start loader with ETag caching."""
+    global _RUNTIME_KB, _PERSONAL_KB, _RUNTIME_LAST_ETAG, _PERSONAL_LAST_ETAG
+    rk_key = _get_env("RUNTIME_KB_KEY")  # e.g., runtime/HIV_DDM_Chatbot_KB.json
+    if rk_key:
+        txt, etag = _get_s3_object_text(rk_key)
+        if txt and (force or etag != _RUNTIME_LAST_ETAG or _RUNTIME_KB is None):
+            _RUNTIME_KB = json.loads(txt)
+            _RUNTIME_LAST_ETAG = etag
+            logger.info(f"Loaded RUNTIME_KB key={rk_key} version={(_RUNTIME_KB.get('meta') or {}).get('version')}")
+    pk_key = _get_env("PERSONAL_KB_KEY")  # e.g., runtime/personal_kb.json
+    if pk_key:
+        txt, etag = _get_s3_object_text(pk_key)
+        if txt and (force or etag != _PERSONAL_LAST_ETAG or _PERSONAL_KB is None):
+            _PERSONAL_KB = json.loads(txt)
+            _PERSONAL_LAST_ETAG = etag
+            logger.info(f"Loaded PERSONAL_KB key={pk_key} version={(_PERSONAL_KB.get('meta') or {}).get('version')}")
+
+def _ensure_config_loaded():
+    global _CONFIG_LOADED
+    if not _CONFIG_LOADED:
+        _load_runtime_kbs(force=True)
+        _CONFIG_LOADED = True
+
+# ---------- History normalization ----------
+def _normalize_history_items(history_raw) -> list[dict]:
+    out = []
+    for it in (history_raw or []):
+        try:
+            if (it.get("type") or "").upper() != "TEXT":
+                continue
+            role_src = (it.get("sentBy") or "").upper()
+            text = (it.get("message") or "").strip()
+            if not text:
+                continue
+            if role_src == "USER":
+                out.append({"role": "user", "content": [{"text": text}]})
+            elif role_src == "BOT":
+                out.append({"role": "assistant", "content": [{"text": text}]})
+        except Exception:
+            continue
+    return out
+
+# ---------- Personal & Runtime matching ----------
+def _norm(s: str) -> str:
+    return (s or "").lower().strip()
+
+def _match_personal(prompt: str):
+    if not _PERSONAL_KB:
+        return None
+    q = _norm(prompt)
+    for item in _PERSONAL_KB.get("qna", []):
+        if _norm(item.get("question_exact")) == q:
+            return item
+        for p in item.get("patterns", []) or []:
+            if p and _norm(p) in q:
+                return item
+    return None
+
+def _match_runtime(prompt: str):
+    if not _RUNTIME_KB:
+        return None
+    q = _norm(prompt)
+    for item in _RUNTIME_KB.get("qna", []):
+        if _norm(item.get("question_exact")) == q:
+            return item
+        for p in item.get("patterns", []) or []:
+            if p and _norm(p) in q:
+                return item
+    return None
+
+def _get_source_meta(source_code: str) -> dict | None:
+    try:
+        return (_RUNTIME_KB or {}).get("sources", {}).get(source_code)
+    except Exception:
+        return None
+
+# ---------- URL & Markdown helpers ----------
+def _md_link(url: str, label: str | None = None) -> str:
+    try:
+        host = urllib.parse.urlparse(url).netloc or url
+    except Exception:
+        host = url
+    return f"[{label or host}]({url})"
+
+def _title_for_url(url: str) -> str:
+    try:
+        p = urllib.parse.urlparse(url)
+        host = (p.netloc or "").lower()
+        path_last = (p.path.rstrip("/").split("/")[-1] if p.path else "").replace("-", " ").strip()
+    except Exception:
+        host, path_last = "", ""
+    domain_map = {
+        "aidsinfo.unaids.org": "UNAIDS AIDSinfo",
+        "www.who.int": "World Health Organization (WHO)",
+        "who.int": "World Health Organization (WHO)",
+        "prepwatch.org": "PrEPWatch",
+        "phia.icap.columbia.edu": "ICAP PHIA",
+        "icap.columbia.edu": "ICAP at Columbia University"
     }
-}
+    if host in domain_map:
+        return domain_map[host]
+    if path_last and "." not in path_last:
+        return path_last.title()
+    if host:
+        parts = host.split(".")
+        if len(parts) > 2:
+            host = ".".join(parts[-2:])
+        return host
+    return url
 
-# --- Global Clients and Helper Functions (Keep existing) ---
-lambda_region = os.environ.get('AWS_REGION', 'us-east-1')
-logger.info(f"Using AWS Region: {lambda_region}")
+# ---------- Suggested reference picking ----------
+def _tokenize(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
 
-agent_runtime_client = None
-try:
-    agent_runtime_client = boto3.client("bedrock-agent-runtime", region_name=lambda_region)
-except Exception as e:
-    logger.error(f"Error initializing bedrock-agent-runtime client: {e}")
-
-bedrock_runtime_client = None
-try:
-    bedrock_runtime_client = boto3.client(service_name="bedrock-runtime", region_name=lambda_region)
-except Exception as e:
-    logger.error(f"Error initializing bedrock-runtime client: {e}")
-
-def send_ws_message(gateway_client, connection_id, data):
-    # ... keep existing function ...
-    if not gateway_client:
-        logger.error(f"Cannot send message to {connection_id}: gateway_client not available.")
-        return False
+def _url_tokens(u: str) -> set[str]:
     try:
-        gateway_client.post_to_connection(ConnectionId=connection_id, Data=json.dumps(data))
-        logger.info(f"Sent message type '{data.get('type', 'unknown')}' to {connection_id}")
+        p = urllib.parse.urlparse(u)
+        host_parts = p.netloc.lower().split(".")
+        path_parts = re.split(r"[^a-z0-9]+", p.path.lower())
+        return {t for t in host_parts + path_parts if t}
+    except Exception:
+        return set()
+
+def _pick_reference_url(prompt: str) -> str | None:
+    if not REFERENCE_URLS:
+        return None
+    q = _tokenize(prompt)
+    if "prep" in q:
+        q.update({"pre", "preexposure", "prophylaxis"})
+    if "hiv" in q:
+        q.update({"aids"})
+    if "who" in q:
+        q.update({"world", "health", "organization"})
+    if "eswatini" in q or "swaziland" in q:
+        q.update({"sz", "eswatini", "swaziland"})
+    if "ghana" in q:
+        q.update({"gh"})
+    if "kenya" in q:
+        q.update({"ke"})
+    if "lesotho" in q:
+        q.update({"ls"})
+    if "malawi" in q:
+        q.update({"mw"})
+    if "mozambique" in q:
+        q.update({"mz"})
+    if "nigeria" in q:
+        q.update({"ng"})
+    if "tanzania" in q:
+        q.update({"tz"})
+    if "uganda" in q:
+        q.update({"ug"})
+    if "zambia" in q:
+        q.update({"zm"})
+    if "zimbabwe" in q:
+        q.update({"zw"})
+    if {"south", "africa"}.issubset(q):
+        q.update({"za", "rsa", "southafrica"})
+    if {"south", "sudan"}.issubset(q):
+        q.update({"ss", "southsudan"})
+
+    best_url, best_score = None, -1
+    for u in REFERENCE_URLS:
+        toks = _url_tokens(u)
+        score = sum(1 for t in toks if t in q)
+        if "unaids" in toks:
+            score += 1
+        if "who" in toks:
+            score += 1
+        if "prepwatch" in toks:
+            score += 1
+        if "icap" in toks or "phia" in toks:
+            score += 1
+        if score > best_score:
+            best_score, best_url = score, u
+    return best_url or REFERENCE_URLS[0]
+
+# ---------- OpenSearch (optional COUNT support) ----------
+_os = None
+if _OPENSEARCH_AVAILABLE and cfg.OPENSEARCH_ENDPOINT:
+    try:
+        sess = boto3.Session()
+        creds = sess.get_credentials()
+        service = "aoss" if ".aoss." in cfg.OPENSEARCH_ENDPOINT else "es"
+        auth = AWSV4SignerAuth(creds, cfg.REGION, service)
+        host = cfg.OPENSEARCH_ENDPOINT.replace("https://", "")
+        _os = OpenSearch(
+            hosts=[{"host": host, "port": 443}],
+            http_auth=auth,
+            use_ssl=True,
+            verify_certs=True,
+            connection_class=RequestsHttpConnection,
+            timeout=30,
+            pool_maxsize=20,
+        )
+        _ = _os.ping()
+        logger.info("OpenSearch client initialized.")
+    except Exception as e:
+        logger.error(f"OpenSearch init failed: {e}")
+        _os = None
+elif not _OPENSEARCH_AVAILABLE and cfg.OPENSEARCH_ENDPOINT:
+    logger.warning("OpenSearch layer not available; COUNT disabled.")
+
+_COUNT_STARTERS = (
+    "how many papers", "count papers", "number of papers", "how many documents", "count documents",
+    "list papers containing", "list documents containing", "count documents mentioning", "count documents about"
+)
+
+def _looks_like_count(q: str) -> bool:
+    ql = _norm(q)
+    if any(ql.startswith(s) for s in _COUNT_STARTERS):
         return True
-    except ClientError as e:
-        if e.response['Error']['Code'] == 'GoneException':
-            logger.warning(f"Cannot send message to {connection_id}: Connection is gone (GoneException).")
-        else:
-            logger.error(f"Failed to send message type '{data.get('type', 'unknown')}' to {connection_id}: {e}")
-            logger.exception("WebSocket Send Exception Details:")
-        return False
-    except Exception as e:
-         logger.error(f"Unexpected error sending message type '{data.get('type', 'unknown')}' to {connection_id}: {e}")
-         logger.exception("WebSocket Send Unexpected Exception Details:")
-         return False
+    return ("how many" in ql and ("mention" in ql or "contain" in ql)) or ql.startswith("list ")
 
-def send_error_and_end(gateway_client, connection_id, error_text, status_code=500):
-    # ... keep existing function ...
-    error_data = {'statusCode': status_code, 'type': 'error', 'text': error_text}
-    end_data = {'statusCode': status_code, 'type': 'end'}
-    send_ws_message(gateway_client, connection_id, error_data)
-    send_ws_message(gateway_client, connection_id, end_data)
+def _extract_keyword(q: str) -> str | None:
+    m = re.search(r'"([^"]+)"', q) or re.search(r"'([^']+)'", q)
+    if m:
+        kw = m.group(1).strip()
+        return kw if kw else None
+    ql = q.lower()
+    for trigger in ["mention ", "containing ", "contain ", "about "]:
+        if trigger in ql:
+            start = ql.index(trigger) + len(trigger)
+            tail = ql[start:].strip()
+            token = tail.split("?")[0].split(",")[0].strip()
+            token = " ".join(token.split()[:5]).strip('.,!?\";\'')
+            if token:
+                return token
+    return None
 
-def knowledge_base_retrieval(prompt, kb_id):
-    # ... keep existing function ...
-    if not agent_runtime_client:
-        logger.error("Bedrock Agent Runtime client not initialized.")
-        return {"retrievalResults": []}
-    query = {"text": prompt}
+# ---------- Source utilities ----------
+def _clean_filename(s3_uri_or_url: str) -> str:
+    src = s3_uri_or_url or ""
+    if not src:
+        return "Unknown source"
     try:
-        logger.info(f"Retrieving from Knowledge Base ID: {kb_id} with prompt: '{prompt}'")
-        kb_response = agent_runtime_client.retrieve(
-            knowledgeBaseId=kb_id,
-            retrievalQuery=query,
-            retrievalConfiguration={
-                'vectorSearchConfiguration': {
-                    'numberOfResults': 3 # Example: retrieve top 3 results
-                }
-            }
-        )
-        logger.info(f"KB Response received (first 500 chars): {str(kb_response)[:500]}")
-        return kb_response
-    except ClientError as e:
-        logger.error(f"Error during Knowledge Base retrieval: {e}")
-        logger.exception("Knowledge Base Retrieve ClientError Details:")
-        return {"retrievalResults": []}
-    except Exception as e:
-        logger.error(f"Unexpected error during Knowledge Base retrieval: {e}")
-        logger.exception("Knowledge Base Retrieve Unexpected Exception Details:")
-        return {"retrievalResults": []}
-
-def extract_sources(kb_results):
-    # ... keep existing function ...
-    logger.info(f"Extracting and filtering sources from KB results (first 500 chars): {str(kb_results)[:500]}")
-    best_sources_by_uri = {}
-    for result in kb_results.get('retrievalResults', []):
-        location = result.get("location", {})
-        metadata = result.get("metadata", {})
-        score = result.get('score')
-        try:
-            current_score = float(score) if score is not None else 0.0
-        except (ValueError, TypeError):
-            current_score = 0.0
-
-        source_uri = None
-        if location.get("type") == "S3":
-            source_uri = location.get("s3Location", {}).get("uri")
-
-        if source_uri:
-            page_number = metadata.get('x-amz-bedrock-kb-document-page-number')
-            try:
-                page_number = float(page_number) if page_number is not None else None
-            except (ValueError, TypeError):
-                logger.warning(f"Could not convert page number '{page_number}' to float for {source_uri}")
-                page_number = None
-
-            processed_uri = re.sub(r'^s3://([^/]+)/(.*)', r'https://\1.s3.amazonaws.com/\2', source_uri)
-            current_source_info = {
-                "url": processed_uri,
-                "score": current_score,
-                "_s3_uri": source_uri
-            }
-            if page_number is not None:
-                current_source_info["page"] = page_number
-
-            existing_best_score = best_sources_by_uri.get(source_uri, {}).get("score", -1.0)
-            if current_score > existing_best_score:
-                logger.debug(f"Updating best source for {source_uri} with score {current_score} (previous: {existing_best_score})")
-                best_sources_by_uri[source_uri] = current_source_info
-            else:
-                logger.debug(f"Ignoring source for {source_uri} with score {current_score} (best score is {existing_best_score})")
+        if src.startswith("s3://"):
+            part = src.split("/", 3)[-1]
+        elif src.startswith("https://") or src.startswith("http://"):
+            from urllib.parse import urlparse, unquote
+            parsed = urlparse(src)
+            part = parsed.path.lstrip("/")
+            return (unquote(part.split("/")[-1]) or "Unknown source")
         else:
-            logger.warning(f"Could not extract source_uri from result: {result}")
+            part = src
+        from urllib.parse import unquote
+        return (unquote(part.split("/")[-1]) or "Unknown source")
+    except Exception:
+        return src.split("/")[-1] if "/" in src else src
 
-    deduplicated_sources = list(best_sources_by_uri.values())
-    deduplicated_sources.sort(key=lambda x: x.get('score', 0.0), reverse=True)
-    for source in deduplicated_sources:
-        source.pop('_s3_uri', None)
-    logger.info(f"Filtered and processed unique sources: {deduplicated_sources}")
-    return deduplicated_sources
-
-
-def is_relevant(sources):
-    # ... keep existing function ...
-    if not sources:
-        return False
-    top_score = sources[0].get('score', 0)
-    return top_score > 0.4
-
-def transform_history(history, limit=25):
-    # ... keep existing function ...
-    transformed = []
-    last_role = None
-    logger.info(f"Transforming raw history (last {limit} entries): {history[-limit:]}")
-    for entry in history[-limit:]:
-        message_type = entry.get('type')
-        message_content = entry.get('message', '').strip()
-        sent_by = entry.get('sentBy')
-        if not message_type or not sent_by or (message_type == 'TEXT' and not message_content):
-            logger.debug(f"Skipping invalid or empty history entry: {entry}")
-            continue
-        if message_type == 'SOURCES':
-            logger.debug(f"Ignoring SOURCES entry for history transformation: {entry}")
-            continue
-        if message_type == 'TEXT':
-            role = 'user' if sent_by == 'USER' else 'assistant'
-            if role == 'user' and last_role == 'user':
-                logger.debug("Merging consecutive user message.")
-                if transformed and 'content' in transformed[-1] and transformed[-1]['content']:
-                    transformed[-1]['content'][0]['text'] += f"\n{message_content}"
-                else:
-                    transformed.append({"role": role, "content": [{"text": message_content}]})
-                continue
-            elif role == 'assistant' and last_role == 'assistant':
-                logger.debug("Skipping consecutive assistant message.")
-                continue
-            transformed.append({ "role": role, "content": [{"text": message_content}] })
-            last_role = role
-            logger.debug(f"Added history message: Role={role}, Content='{message_content[:50]}...'")
-        else:
-            logger.debug(f"Ignoring message type '{message_type}' for history transformation.")
-
-    if transformed and transformed[0]['role'] == 'assistant':
-        logger.warning("History transformation started with 'assistant', removing first entry.")
-        transformed.pop(0)
-    if transformed and transformed[-1]['role'] == 'assistant':
-        logger.warning("History transformation ended with 'assistant', removing last entry.")
-        transformed.pop()
-    logger.info(f"Result of transform_history: {transformed}")
-    return transformed
-
-
-# --- Main Lambda Handler ---
-def lambda_handler(event, context):
-    logger.info(f"Received event: {json.dumps(event)}")
-
-    connectionId = event.get("connectionId")
-    prompt = event.get("prompt") # Current user prompt
-    history_raw = event.get("history", [])
-    selected_role_key = event.get("role", "researchAssistant")
-
-    # --- Initialize API Gateway Client ---
-    websocket_callback_url = os.environ.get('URL')
-    gateway_client = None
-    if websocket_callback_url:
-        try:
-            gateway_client = boto3.client("apigatewaymanagementapi", endpoint_url=websocket_callback_url)
-        except Exception as e:
-            logger.error(f"Failed to create ApiGatewayManagementApi client with endpoint {websocket_callback_url}: {e}")
-    else:
-        logger.error("Environment variable 'URL' (WebSocket Callback URL) is not set.")
-        return {'statusCode': 500, 'body': json.dumps({'error': 'Server configuration error (Callback URL missing).'})}
-
-    # --- Input Validation ---
-    if not connectionId:
-        logger.error("Missing 'connectionId' in event.")
-        return {'statusCode': 400, 'body': json.dumps({'error': 'Missing connectionId.'})}
-    # We might allow empty prompts later if file context is primary, but for now, require a prompt for most actions
-    # if not prompt:
-    #     logger.warning("Prompt is empty.")
-        # Decide if you want to handle this - send error or proceed?
-        # send_error_and_end(gateway_client, connectionId, "No prompt provided.", 400)
-        # return {'statusCode': 400, 'body': json.dumps({'error': 'No prompt provided.'})}
-
-
-    # **************************************************************** #
-    # *** NEW: Check for Quantitative Count Query                  *** #
-    # **************************************************************** #
-    is_count_query = False
-    if prompt: # Only check if prompt is not None or empty
-        prompt_lower = prompt.lower()
-        # Simple keyword-based detection - can be expanded later
-        count_query_keywords = [
-            "how many papers", "count papers", "number of papers",
-            "in how many documents", "list the papers containing", "list documents with"
-        ]
-        # Check for phrases like "how many papers mention X", "in how many papers does Y appear"
-        if any(phrase in prompt_lower for phrase in count_query_keywords):
-             is_count_query = True
-        elif "how many" in prompt_lower and ("appear" in prompt_lower or "contain" in prompt_lower or "mention" in prompt_lower):
-             is_count_query = True
-        # Add more sophisticated checks if needed (e.g., regex, checking for specific word + count indicator)
-
-    if is_count_query:
-        logger.info(f"Detected quantitative/count query: '{prompt}'")
-
-        # Log a tracking object to CloudWatch Logs
-        tracking_object = {
-            "query_type": "quantitative_count_detected",
-            "original_prompt": prompt,
-            "connection_id": connectionId,
-            "timestamp_utc": datetime.datetime.utcnow().isoformat() # Added timestamp
-        }
-        logger.info(f"COUNT_QUERY_TRACKING: {json.dumps(tracking_object)}") # Make the log easy to find
-
-        # Send placeholder response to frontend
-        response_text = "This looks like a count question. Actual counting feature is under development."
-        response_data = {'statusCode': 200, 'type': 'text', 'text': response_text}
-        send_ws_message(gateway_client, connectionId, response_data)
-
-        # Send end signal
-        end_data = {'statusCode': 200, 'type': 'end'}
-        send_ws_message(gateway_client, connectionId, end_data)
-
-        logger.info("Sent placeholder response for count query and finished.")
-        # Return successfully, bypassing the rest of the RAG/LLM flow
-        return {'statusCode': 200, 'body': json.dumps({'message': 'Handled count query with placeholder.'})}
-    # **************************************************************** #
-    # *** END NEW CHECK                                            *** #
-    # **************************************************************** #
-
-
-    # --- Direct Handling for "List Countries" Query (Keep Existing Logic) ---
-    if prompt: # Re-check prompt exists for this block too
-        prompt_lower = prompt.lower()
-        country_query_phrases = [
-            "what countries", "which countries", "country coverage", "countries covered",
-            "countries do you have", "list of countries", "available countries"
-        ]
-        if any(phrase in prompt_lower for phrase in country_query_phrases):
-            logger.info(f"Detected country list query: '{prompt}'")
+def _doc_url_from_s3_uri(s3_uri: str) -> str:
+    if not s3_uri or not s3_uri.startswith("s3://"):
+        return s3_uri or ""
+    try:
+        parts = s3_uri[5:].split("/", 1)
+        if len(parts) != 2:
+            return s3_uri
+        bucket, key = parts[0], parts[1]
+        if s3 and cfg.S3_BUCKET_NAME and bucket == cfg.S3_BUCKET_NAME:
             try:
-                sorted_countries = sorted(list(SUPPORTED_COUNTRIES))
-                formatted_countries = ", ".join(c.title() for c in sorted_countries)
-                response_text = f"Based on the documents currently available, I have information related to the following countries: {formatted_countries}."
-                response_data = {'statusCode': 200, 'type': 'text', 'text': response_text}
-                send_ws_message(gateway_client, connectionId, response_data)
-                end_data = {'statusCode': 200, 'type': 'end'}
-                send_ws_message(gateway_client, connectionId, end_data)
-                logger.info("Successfully handled country list request directly.")
-                return {'statusCode': 200, 'body': json.dumps({'message': 'Handled country list request directly.'})}
+                return s3.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": cfg.S3_BUCKET_NAME, "Key": key, "ResponseContentDisposition": "inline"},
+                    ExpiresIn=3600,
+                )
             except Exception as e:
-                logger.error(f"Error formatting or sending country list: {e}")
-                send_error_and_end(gateway_client, connectionId, "Sorry, I encountered an error trying to list the countries.", 500)
-                return {'statusCode': 500, 'body': json.dumps({'error': 'Error handling country list request.'})}
+                logger.warning(f"Presign failed for {s3_uri}: {e}")
+                return f"https://{bucket}.s3.amazonaws.com/{key}"
+        else:
+            return s3_uri
+    except Exception:
+        return s3_uri
 
+def _score_value(v):
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        if v is None:
+            return float("-inf")
+        return float(v)
+    except Exception:
+        return float("-inf")
 
-    # --- If NOT a count query or country list query, proceed with normal RAG/LLM flow ---
+def _dedupe_sources_best(items: list[dict]) -> list[dict]:
+    best_by_key: dict[str, dict] = {}
+    order: list[str] = []
+    for it in items or []:
+        url = (it.get("url") or "").strip()
+        label = (it.get("label") or _clean_filename(url) or url).strip()
+        key = label.lower()
+        cur_best = best_by_key.get(key)
+        if not cur_best:
+            best_by_key[key] = it
+            order.append(key)
+            continue
+        s_new = _score_value(it.get("score"))
+        s_old = _score_value(cur_best.get("score"))
+        take_new = False
+        if s_new > s_old:
+            take_new = True
+        elif s_new == s_old:
+            has_page_new = "page" in it and it["page"] is not None
+            has_page_old = "page" in cur_best and cur_best["page"] is not None
+            if has_page_new and not has_page_old:
+                take_new = True
+            elif has_page_new == has_page_old:
+                https_new = (it.get("url") or "").startswith("https://")
+                https_old = (cur_best.get("url") or "").startswith("https://")
+                if https_new and not https_old:
+                    take_new = True
+        if take_new:
+            best_by_key[key] = it
+    return [best_by_key[k] for k in order]
 
-    # --- Environment Variable Check (KB_ID) ---
-    kb_id = os.environ.get('KNOWLEDGE_BASE_ID')
+# ---------- Bedrock KB retrieval ----------
+def _kb_retrieve(prompt: str, kb_id: str, k: int = 10) -> tuple[str, list[dict]]:
     if not kb_id:
-        logger.error("Environment variable 'KNOWLEDGE_BASE_ID' is not set.")
-        send_error_and_end(gateway_client, connectionId, "Server configuration error (KB ID missing).", 500)
-        return {'statusCode': 500, 'body': json.dumps({'error': 'Server configuration error (KB ID missing).'})}
-
-    # --- History Validation ---
-    if not isinstance(history_raw, list):
-        logger.warning(f"Received 'history' is not a list (type: {type(history_raw)}). Using empty history.")
-        history = []
-    else:
-        history = history_raw
-
-    # --- KB Retrieval ---
-    rag_info = ""
-    sources = []
-    is_kb_relevant = False
-    if prompt: # Only query KB if there is a prompt (redundant check, but safe)
-        kb_search_term = prompt
-        try:
-            kb_response = knowledge_base_retrieval(kb_search_term, kb_id)
-            sources = extract_sources(kb_response)
-            is_kb_relevant = is_relevant(sources)
-            if is_kb_relevant:
-                logger.info("KB results are relevant. Preparing RAG context.")
-                rag_info = "\n\n".join(
-                    result.get("content", {}).get("text", "")
-                    for result in kb_response.get("retrievalResults", [])
-                    if result.get("content", {}).get("text")
-                ).strip()
-            else:
-                logger.info("KB results are not relevant or no sources found.")
-        except Exception as kb_e:
-            logger.error(f"An error occurred during KB processing: {kb_e}")
-            is_kb_relevant = False
-            rag_info = ""
-            sources = []
-    else:
-        logger.info("Skipping KB retrieval as prompt is empty.")
-
-
-    # --- Prepare Messages for Bedrock ---
+        return "", []
     try:
-        transformed_history = transform_history(history)
-    except Exception as hist_e:
-        logger.error(f"Error during history transformation: {hist_e}")
-        logger.exception("History Transformation Exception Details:")
-        send_error_and_end(gateway_client, connectionId, "Error processing chat history.", 500)
-        return {'statusCode': 500, 'body': json.dumps({'error': 'Error processing chat history.'})}
-
-    current_user_prompt = prompt if prompt else " " # Use space if prompt was empty
-
-    # --- Construct Final Prompt Text (Handle RAG) ---
-    llm_prompt_text = current_user_prompt
-    if is_kb_relevant and rag_info:
-        logger.info(f"Augmenting current prompt with RAG context for role {selected_role_key}.")
-        rag_prefix = ""
-        if selected_role_key == "researchAssistant":
-             rag_prefix = f"""Knowledge Source Information:
----
-{rag_info}
----
-
-Based ONLY on the information above, answer the user's question: """
-        else:
-              rag_prefix = f"""Use the following information if relevant to answer the user's question:
-Knowledge Source Information:
----
-{rag_info}
----
-
-User's question: """
-        llm_prompt_text = f"{rag_prefix}{current_user_prompt}"
-
-    # --- Combine History and Current Prompt ---
-    messages_for_api = transformed_history
-    messages_for_api.append({
-        "role": "user",
-        "content": [{"text": llm_prompt_text}]
-    })
-
-    # --- Set System Prompt for Bedrock ---
-    persona = BOT_PERSONAS.get(selected_role_key, BOT_PERSONAS["default"])
-    system_prompt_text = persona["prompt"]
-    bot_name = persona["name"]
-    logger.info(f"Selected Bot Persona: {bot_name} (Key: {selected_role_key})")
-    system_prompts = [{"text": system_prompt_text}] if system_prompt_text else None
-
-    logger.info(f"Sending query to LLM. System Prompt[:100]: '{system_prompt_text[:100]}...'. Messages: {json.dumps(messages_for_api)}")
-
-    # --- Invoke Bedrock & Stream Response ---
-    if not bedrock_runtime_client:
-        logger.error("Bedrock Runtime client not initialized. Cannot call Converse API.")
-        send_error_and_end(gateway_client, connectionId, "Server error (Bedrock client unavailable).", 500)
-        return {'statusCode': 500, 'body': json.dumps({'error': 'Server error (Bedrock client unavailable).'})}
-
-    response = None
-    stream = None
-    stream_finished_normally = False
-    full_response_text = ""
-
-    try:
-        response = bedrock_runtime_client.converse_stream(
-            modelId="anthropic.claude-3-5-sonnet-20240620-v1:0",
-            messages=messages_for_api,
-            system=system_prompts,
+        resp = agent_rt.retrieve(
+            knowledgeBaseId=kb_id,
+            retrievalQuery={"text": prompt},
+            retrievalConfiguration={"vectorSearchConfiguration": {"numberOfResults": k}},
         )
-        logger.info("Received stream response from Bedrock Converse API.")
-        stream = response.get('stream')
-
-        if stream:
-            logger.info("Processing stream...")
-            for event in stream:
-                block_type = "unknown"
-                message_text = ""
-
-                if 'messageStart' in event:
-                    logger.debug(f"Stream message start: Role = {event['messageStart'].get('role')}")
-                    block_type = "start"
-                elif 'contentBlockDelta' in event:
-                    block_type = "delta"
-                    delta = event['contentBlockDelta']['delta']
-                    if 'text' in delta:
-                        message_text = delta['text']
-                        if message_text:
-                            full_response_text += message_text
-                            delta_data = {'statusCode': 200, 'type': block_type, 'text': message_text}
-                            if not send_ws_message(gateway_client, connectionId, delta_data):
-                                logger.warning("Stopping stream processing as WebSocket send failed (client likely disconnected).")
-                                break
-                elif 'messageStop' in event:
-                    stop_reason = event['messageStop'].get('stopReason')
-                    logger.info(f"Stream message stop. Reason: {stop_reason}")
-                    stream_finished_normally = True
-                elif 'metadata' in event:
-                    logger.debug(f"Stream metadata received: {event['metadata']}")
-                    if event['metadata'].get('stopReason'):
-                        stream_finished_normally = True
-                    break # Assume safe to break after metadata
-                elif 'contentBlockStop' in event:
-                     logger.debug("Stream content block stop event received.")
-                else:
-                    unhandled_key = list(event.keys())[0] if event else "None"
-                    logger.warning(f"Unhandled stream event type/key: {unhandled_key}")
-
-            # --- After stream processing loop ---
-            logger.info(f"Finished processing stream loop. Stream finished normally: {stream_finished_normally}")
-            logger.info(f"Full response text accumulated: {full_response_text[:500]}...")
-
-            # Send sources only if relevant and found earlier
-            if is_kb_relevant and sources:
-                sources_data = {'statusCode': 200, 'type': 'sources', 'sources': sources}
-                send_ws_message(gateway_client, connectionId, sources_data)
-
-            # Send end signal
-            status_code = 200 if stream_finished_normally else 500
-            end_data = {'statusCode': status_code, 'type': 'end'}
-            if not stream_finished_normally:
-                end_data['reason'] = 'Stream did not report a normal stop reason.'
-            send_ws_message(gateway_client, connectionId, end_data)
-
-        else:
-            logger.error("No 'stream' object found in Bedrock Converse API response.")
-            send_error_and_end(gateway_client, connectionId, "LLM response error (no stream).", 500)
-            return {'statusCode': 500, 'body': json.dumps({'error': 'Bedrock response missing stream.'})}
-
+        results = resp.get("retrievalResults") or []
+        if not results:
+            return "", []
+        snippets: list[str] = []
+        sources_raw: list[dict] = []
+        for r in results:
+            txt = (r.get("content") or {}).get("text", "")
+            if txt:
+                snippets.append(txt)
+            loc = (r.get("location") or {}).get("s3Location") or {}
+            s3_uri = loc.get("uri")
+            score = r.get("score")
+            page = (r.get("metadata") or {}).get("x-amz-bedrock-kb-document-page-number")
+            url = s3_uri
+            if s3_uri and cfg.S3_BUCKET_NAME and s3 and s3_uri.startswith(f"s3://{cfg.S3_BUCKET_NAME}/"):
+                try:
+                    key = s3_uri.split(f"s3://{cfg.S3_BUCKET_NAME}/", 1)[1]
+                    url = s3.generate_presigned_url(
+                        "get_object",
+                        Params={"Bucket": cfg.S3_BUCKET_NAME, "Key": key, "ResponseContentDisposition": "inline"},
+                        ExpiresIn=3600,
+                    )
+                except Exception as e:
+                    logger.warning(f"Presign failed for {s3_uri}: {e}")
+            src: dict = {"url": url}
+            if page is not None:
+                src["page"] = page
+            if isinstance(score, (int, float)):
+                src["score"] = float(score)
+            if url:
+                src["label"] = _clean_filename(url)
+                sources_raw.append(src)
+        deduped = _dedupe_sources_best(sources_raw)
+        return ("\n\n".join(snippets).strip(), deduped[:2])
     except ClientError as e:
-        error_text = f'LLM API Error: {type(e).__name__} - {e}'
-        logger.error(error_text)
-        logger.exception("Bedrock Converse API ClientError Details:")
-        send_error_and_end(gateway_client, connectionId, f'LLM API Error: {type(e).__name__}', 500)
-        return {'statusCode': 500, 'body': json.dumps({'error': error_text})}
+        logger.error(f"KB retrieve ClientError: {e}")
+        return "", []
     except Exception as e:
-        error_text = f'Error during LLM interaction: {type(e).__name__} - {e}'
-        logger.error(error_text)
-        logger.exception("LLM Interaction Unexpected Exception Details:")
-        send_error_and_end(gateway_client, connectionId, f'Error during LLM interaction: {type(e).__name__}', 500)
-        return {'statusCode': 500, 'body': json.dumps({'error': error_text})}
+        logger.error(f"KB retrieve unexpected error: {e}")
+        return "", []
 
-    logger.info("Successfully processed request and streamed response or handled error.")
-    return {'statusCode': 200, 'body': json.dumps({'message': 'Message processed successfully'})}
+# ---------- Snippets for reason generation ----------
+def _basename_from_url(u: str) -> str:
+    try:
+        p = urllib.parse.urlparse(u)
+        name = (p.path or "").split("/")[-1]
+        name = urllib.parse.unquote(name or "")
+        name = name.split("?")[0].split("#")[0]
+        return name
+    except Exception:
+        return u or ""
+
+def _collect_doc_snippets(prompt: str, k: int = 20) -> dict:
+    out = {}
+    kb_id = cfg.KNOWLEDGE_BASE_ID
+    if not kb_id:
+        return out
+    try:
+        resp = agent_rt.retrieve(
+            knowledgeBaseId=kb_id,
+            retrievalQuery={"text": prompt},
+            retrievalConfiguration={"vectorSearchConfiguration": {"numberOfResults": k}},
+        )
+        results = resp.get("retrievalResults") or []
+        for r in results:
+            txt = (r.get("content") or {}).get("text") or ""
+            loc = (r.get("location") or {}).get("s3Location") or {}
+            s3_uri = loc.get("uri") or ""
+            if not s3_uri or not txt:
+                continue
+            url = s3_uri
+            if s3_uri.startswith("s3://") and s3 and cfg.S3_BUCKET_NAME and s3_uri.startswith(f"s3://{cfg.S3_BUCKET_NAME}/"):
+                try:
+                    key = s3_uri.split(f"s3://{cfg.S3_BUCKET_NAME}/", 1)[1]
+                    url = s3.generate_presigned_url(
+                        "get_object",
+                        Params={"Bucket": cfg.S3_BUCKET_NAME, "Key": key, "ResponseContentDisposition": "inline"},
+                        ExpiresIn=3600,
+                    )
+                except Exception as e:
+                    logger.warning(f"Presign failed for {s3_uri}: {e}")
+            key = _basename_from_url(s3_uri).lower()
+            if key in out:
+                continue
+            out[key] = {"snippet": txt, "url": url, "label": _clean_filename(s3_uri)}
+        return out
+    except Exception as e:
+        logger.warning(f"_collect_doc_snippets error: {e}")
+        return out
+
+# ---------- Model helpers ----------
+def _extract_text_from_converse(resp) -> str:
+    try:
+        parts = (resp.get("output") or {}).get("message", {}).get("content", [])
+        return "".join(p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p)
+    except Exception:
+        return ""
+
+def _model_complete_text(messages, system=None) -> str:
+    try:
+        kwargs = {"modelId": MODEL_ID, "messages": messages}
+        if system:
+            kwargs["system"] = [{"text": system}] if isinstance(system, str) else system
+        resp = brt.converse(**kwargs)
+        text = _extract_text_from_converse(resp)
+        if text:
+            return text
+    except Exception as e:
+        logger.warning(f"converse failed, falling back to stream: {e}")
+    try:
+        resp = brt.converse_stream(modelId=MODEL_ID, messages=messages, system=([{"text": system}] if system else None))
+        stream = resp.get("stream")
+        acc = []
+        for ev in stream:
+            if "contentBlockDelta" in ev:
+                delta = (ev["contentBlockDelta"].get("delta") or {}).get("text")
+                if delta:
+                    acc.append(delta)
+            elif "messageStop" in ev:
+                break
+        return "".join(acc)
+    except Exception as e:
+        logger.error(f"converse_stream failed: {e}")
+        return ""
+
+def _safe_json_from_text(txt: str) -> dict:
+    try:
+        start = txt.find("{")
+        end = txt.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(txt[start:end+1])
+    except Exception:
+        pass
+    return {}
+
+def _gen_relevance_reasons_via_model(user_prompt: str, doc_snips: dict) -> dict:
+    if not doc_snips:
+        return {}
+    docs_arr = []
+    for k, v in doc_snips.items():
+        snip = (v.get("snippet") or "").strip()
+        if not snip:
+            continue
+        if len(snip) > 900:
+            snip = snip[:900] + "…"
+        docs_arr.append({"key": k, "snippet": snip, "label": v.get("label") or k})
+    if not docs_arr:
+        return {}
+
+    system_text = (
+        "You write one-sentence reasons why each document is relevant to the user's question. "
+        "Base the reason ONLY on the provided snippet text; don't invent facts. "
+        "Be specific (e.g., 'covers Nigeria ART and PrEP guidance, 2020 national guideline'). "
+        "Return pure JSON mapping each 'key' to a single reason string. No extra commentary."
+    )
+    user_text = (
+        "User question:\n"
+        f"{user_prompt}\n\n"
+        "Docs:\n"
+        + json.dumps({"docs": docs_arr}, ensure_ascii=False)
+    )
+    messages = [{"role": "user", "content": [{"text": user_text}]}]
+    txt = _model_complete_text(messages, system=system_text)
+    obj = _safe_json_from_text(txt)
+    if "reasons" in obj and isinstance(obj["reasons"], dict):
+        return {k: (v or "").strip() for k, v in obj["reasons"].items()}
+    return {k: (v or "").strip() for k, v in obj.items() if isinstance(v, str)}
+
+# ---------- URL detection ----------
+_URL_RE = re.compile(r"https?://[^\s)>\]]+", re.IGNORECASE)
+
+def _extract_first_url_from_history(history_raw) -> str | None:
+    for it in reversed(history_raw or []):
+        try:
+            if (it.get("type") or "").upper() != "TEXT":
+                continue
+            if (it.get("sentBy") or "").upper() != "BOT":
+                continue
+            msg = (it.get("message") or "")
+            m = _URL_RE.search(msg)
+            if m:
+                return m.group(0)
+        except Exception:
+            continue
+    return None
+
+# ---------- Summarization (PDF) ----------
+def _kb_retrieve_for_doc(prompt: str, doc_url_hint: str, k: int = 20) -> tuple[str, list[dict]]:
+    all_text, all_sources = _kb_retrieve(prompt, cfg.KNOWLEDGE_BASE_ID, k)
+    if not (all_text or all_sources):
+        return "", []
+    hint = _basename_from_url(doc_url_hint)
+    bias_prompt = f"{hint} {prompt}".strip()
+    text2, sources2 = _kb_retrieve(bias_prompt, cfg.KNOWLEDGE_BASE_ID, k)
+    preferred_sources = [s for s in (sources2 or []) if _basename_from_url(s.get('url') or "").lower() == hint.lower()]
+    if preferred_sources:
+        return text2, preferred_sources
+    filtered_sources = [s for s in (all_sources or []) if _basename_from_url(s.get('url') or "").lower() == hint.lower()]
+    return (all_text if filtered_sources else all_text), (filtered_sources or all_sources)
+
+def _stream_summary_from_chunks(connection_id: str, prompt: str, doc_url: str, history_messages: list[dict] | None = None):
+    kb_text, kb_sources = _kb_retrieve_for_doc(prompt, doc_url, k=20)
+    if not kb_text:
+        _end_with_error(connection_id, "I couldn’t retrieve that document’s text from the knowledge base.", 404)
+        return
+
+    user_text = (
+        "You will summarize an official PDF. Use ONLY the provided snippets; do not invent facts. "
+        "Write a concise, structured brief with:\n"
+        "• Purpose & scope\n"
+        "• Key recommendations / policies\n"
+        "• Priority populations & service delivery\n"
+        "• Testing, treatment & prevention highlights\n"
+        "• Any dates/versions that matter\n"
+        "Keep it clear and bulleted. If something is unclear, say so.\n\n"
+        f"<doc_url>{doc_url}</doc_url>\n"
+        "<knowledge_snippets>\n"
+        f"{kb_text}\n"
+        "</knowledge_snippets>\n\n"
+        f"User request: {prompt}"
+    )
+
+    messages: list[dict] = []
+    if history_messages:
+        messages.extend(history_messages)
+    messages.append({"role": "user", "content": [{"text": user_text}]})
+    system = [{"text": (cfg.SYSTEM_PROMPT or "") + "\nBe accurate and concise."}] if cfg.SYSTEM_PROMPT else [{"text": "Be accurate and concise."}]
+
+    try:
+        resp = brt.converse_stream(modelId=MODEL_ID, messages=messages, system=system)
+    except ClientError as e:
+        logger.error(f"Bedrock ClientError (summary): {e}")
+        _end_with_error(connection_id, f"Model error: {e.response.get('Error',{}).get('Code','Unknown')}", 500)
+        return
+
+    stream = resp.get("stream")
+    if not stream:
+        _end_with_error(connection_id, "Model stream not available.", 500)
+        return
+
+    for ev in stream:
+        if "contentBlockDelta" in ev:
+            delta = (ev["contentBlockDelta"].get("delta") or {}).get("text")
+            if delta:
+                _send_ws(connection_id, {"type": "delta", "statusCode": 200, "format": "markdown", "text": delta})
+        elif "messageStop" in ev:
+            break
+        elif "internalServerException" in ev or "modelStreamErrorException" in ev \
+            or "throttlingException" in ev or "validationException" in ev:
+            err = ev.get("internalServerException") or ev.get("modelStreamErrorException") \
+                or ev.get("throttlingException") or ev.get("validationException")
+            logger.error(f"Stream error (summary): {err}")
+            _end_with_error(connection_id, "Model streaming error.", 500)
+            return
+
+    # No structured "sources" payload anymore.
+    _send_ws(connection_id, {"type": "end", "statusCode": 200})
+
+# ---------- WebSocket helpers ----------
+def _send_ws(connection_id: str, payload: dict):
+    if not ws:
+        logger.error("WebSocket client not configured (URL env missing).")
+        return
+    try:
+        ws.post_to_connection(ConnectionId=connection_id, Data=json.dumps(payload))
+    except ClientError as e:
+        logger.error(f"WebSocket post_to_connection error: {e}")
+
+def _end_with_error(connection_id: str, message: str, code: int = 500):
+    _send_ws(connection_id, {"type": "error", "statusCode": code, "text": message})
+    _send_ws(connection_id, {"type": "end", "statusCode": code})
+
+# ---------- Model talk ----------
+_HIV_TOKENS = {
+    "hiv", "aids", "prep", "pre-exposure", "prophylaxis", "incidence", "prevalence", "who", "unaids",
+    "scorecards", "gpc", "statcompiler", "dhis2", "phia", "agyw", "key", "populations", "psat", "shipp"
+}
+def _should_use_kb(prompt: str) -> bool:
+    toks = set(re.findall(r"[a-z0-9\-]+", _norm(prompt)))
+    return any(t in toks for t in _HIV_TOKENS)
+
+def _runtime_relevant_resources(prompt: str, top_n: int = 4) -> list[dict]:
+    resources = (_RUNTIME_KB or {}).get("resources", [])
+    if not resources:
+        return []
+    q_tokens = set(re.findall(r"[a-z0-9\-]+", _norm(prompt)))
+    scored = []
+    for r in resources:
+        text = " ".join([
+            r.get("name", ""),
+            r.get("summary", ""),
+            " ".join(r.get("when_to_use", []) or []),
+            " ".join(r.get("match_terms", []) or []),
+            r.get("category", "")
+        ]).lower()
+        r_tokens = set(re.findall(r"[a-z0-9\-]+", text))
+        overlap = len(q_tokens.intersection(r_tokens))
+        if "agyw" in q_tokens and "agyw" in r_tokens:
+            overlap += 2
+        if "district" in q_tokens or "subnational" in q_tokens:
+            if "sub" in r_tokens or "district" in r_tokens:
+                overlap += 1
+        if "prep" in q_tokens and "prep" in r_tokens:
+            overlap += 2
+        if "testing" in q_tokens and "statcompiler" in r.get("name","").lower():
+            overlap += 1
+        if overlap > 0:
+            scored.append((overlap, r))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [r for _, r in scored[:max(1, top_n)]]
+
+def _build_runtime_context(prompt: str) -> str:
+    try:
+        rules = "\n".join((_RUNTIME_KB or {}).get("style", {}).get("answer_rules", [])[:3])
+        picks = _runtime_relevant_resources(prompt, top_n=4)
+        lines = []
+        for r in picks:
+            name = r.get("name", "Resource")
+            url = r.get("url", "")
+            summary = r.get("summary", "")
+            use = "; ".join(r.get("when_to_use", [])[:2]) if r.get("when_to_use") else ""
+            caveat = "; ".join(r.get("caveats", [])[:1]) if r.get("caveats") else ""
+            bits = [summary]
+            if use:
+                bits.append(f"When to use: {use}")
+            if caveat:
+                bits.append(f"Caveat: {caveat}")
+            joined = " ".join([b for b in bits if b]).strip()
+            if url:
+                lines.append(f"- {name} — {joined} (URL: {url})")
+            else:
+                lines.append(f"- {name} — {joined}")
+        rules_block = f"<answer_rules>\n{rules}\n</answer_rules>\n" if rules else ""
+        picks_block = "\n".join(lines) if lines else ""
+        if not (rules_block or picks_block):
+            return ""
+        return f"{rules_block}<runtime_resource_map>\n{picks_block}\n</runtime_resource_map>"
+    except Exception:
+        return ""
+
+def _talk_with_optional_kb(connection_id: str, prompt: str, history_messages: list[dict] | None = None):
+    use_kb = _should_use_kb(prompt)
+
+    ref_url = None
+    if use_kb:
+        try:
+            ref_url = _pick_reference_url(prompt)
+            if ref_url:
+                _ = _title_for_url(ref_url)
+        except Exception:
+            ref_url = None
+
+    runtime_ctx = _build_runtime_context(prompt) if use_kb else ""
+    kb_text, kb_sources = ("", [])
+    if use_kb:
+        kb_text, kb_sources = _kb_retrieve(prompt, cfg.KNOWLEDGE_BASE_ID)
+
+    if runtime_ctx or kb_text:
+        user_text = (
+            "Use the following runtime routing map and brief bios to choose the right data source/tool. "
+            "If helpful, consult the provided excerpts. "
+            "Do not mention internal tools. "
+            "CRITICAL FORMAT: Start with one plain-English sentence answering the question. "
+            "Do NOT begin with a URL, a label (e.g., 'UNAIDS AIDSinfo'), or a list. "
+            "Only after that sentence, you may add brief details. "
+            "Do not include raw URLs in the body—tools may attach sources separately.\n"
+            f"{runtime_ctx}\n"
+            f"<doc_excerpts>\n{kb_text}\n</doc_excerpts>\n\n"
+            f"User question: {prompt}"
+        )
+    else:
+        user_text = (
+            "Answer helpfully and accurately. If information is missing, say what would help.\n\n"
+            f"User question: {prompt}"
+        )
+
+    messages: list[dict] = []
+    if history_messages:
+        messages.extend(history_messages)
+    messages.append({"role": "user", "content": [{"text": user_text}]})
+    system = [{"text": cfg.SYSTEM_PROMPT}] if cfg.SYSTEM_PROMPT else None
+
+    streamed_text_parts: list[str] = []
+    try:
+        resp = brt.converse_stream(modelId=MODEL_ID, messages=messages, system=system)
+    except ClientError as e:
+        logger.error(f"Bedrock ClientError: {e}")
+        _end_with_error(connection_id, f"Model error: {e.response.get('Error',{}).get('Code','Unknown')}", 500)
+        return
+
+    stream = resp.get("stream")
+    if not stream:
+        _end_with_error(connection_id, "Model stream not available.", 500)
+        return
+
+    for ev in stream:
+        if "contentBlockDelta" in ev:
+            delta = (ev["contentBlockDelta"].get("delta") or {}).get("text")
+            if delta:
+                streamed_text_parts.append(delta)
+                _send_ws(connection_id, {"type": "delta", "statusCode": 200, "format": "markdown", "text": delta})
+        elif "messageStop" in ev:
+            break
+        elif "internalServerException" in ev or "modelStreamErrorException" in ev \
+            or "throttlingException" in ev or "validationException" in ev:
+            err = ev.get("internalServerException") or ev.get("modelStreamErrorException") \
+                or ev.get("throttlingException") or ev.get("validationException")
+            logger.error(f"Stream error: {err}")
+            _end_with_error(connection_id, "Model streaming error.", 500)
+            return
+
+    # Append one extra hyperlink if model emitted a bare URL.
+    try:
+        full_summary = "".join(streamed_text_parts)
+        m = _URL_RE.search(full_summary or "")
+        if m:
+            other_url = m.group(0).strip()
+            already_linked = re.search(r"\]\(\s*" + re.escape(other_url) + r"\s*\)", full_summary or "", flags=re.IGNORECASE)
+            if other_url and other_url != (ref_url or "") and not already_linked:
+                _send_ws(connection_id, {
+                    "type": "delta",
+                    "statusCode": 200,
+                    "format": "markdown",
+                    "text": "\n\n" + _md_link(other_url, _title_for_url(other_url)) + "\n"
+                })
+    except Exception as e:
+        logger.warning(f"Post-append hyperlink step error: {e}")
+
+    # Inline suggested reference
+    try:
+        if ref_url:
+            ref_domain = urllib.parse.urlparse(ref_url).netloc.lower()
+            full_summary = "".join(streamed_text_parts)
+            already_contains_url = (ref_url in (full_summary or ""))
+            already_linked_domain = bool(re.search(
+                r"\]\(\s*https?://[^)]*" + re.escape(ref_domain) + r"[^)]*\)",
+                full_summary or "",
+                flags=re.IGNORECASE
+            ))
+            if not already_contains_url and not already_linked_domain:
+                if ref_domain.endswith("aidsinfo.unaids.org"):
+                    prefix = "\n\nHIV estimates broken down by age and gender. (right here)\n\n"
+                    link_md = _md_link(ref_url, ref_url)
+                else:
+                    prefix = "\n\n"
+                    link_md = _md_link(ref_url, _title_for_url(ref_url))
+                _send_ws(connection_id, {
+                    "type": "delta",
+                    "statusCode": 200,
+                    "format": "markdown",
+                    "text": prefix + link_md + "\n"
+                })
+    except Exception as e:
+        logger.warning(f"Inline suggested reference append error: {e}")
+
+    # -------- Inline-only "Sources at a glance" (reason-first) --------
+    sources_to_send = []
+    if use_kb and kb_sources:
+        sources_to_send.extend(kb_sources)
+    if use_kb and ref_url and not sources_to_send:
+        sources_to_send.append({"url": ref_url, "label": _title_for_url(ref_url)})
+
+    sources_to_send = _dedupe_sources_best(sources_to_send)
+
+    if sources_to_send:
+        doc_snips_all = _collect_doc_snippets(prompt, k=20) if use_kb else {}
+        want_keys = set()
+        for s in sources_to_send:
+            url = (s.get("url") or "").strip()
+            if url:
+                want_keys.add(_basename_from_url(url).lower())
+        doc_snips = {k: v for k, v in doc_snips_all.items() if k in want_keys}
+        reasons = _gen_relevance_reasons_via_model(prompt, doc_snips) if doc_snips else {}
+
+        inline_lines = []
+        for s in (sources_to_send or []):
+            url = (s.get("url") or "").strip()
+            base_label = (s.get("label") or _title_for_url(url) or "Source").strip()
+            key = _basename_from_url(url).lower() if url else base_label.lower()
+            reason = (reasons.get(key) or "").strip()
+            if url:
+                if reason:
+                    inline_lines.append(f"- {reason} — {_md_link(url, base_label)}")
+                else:
+                    inline_lines.append(f"- relevant to the question — {_md_link(url, base_label)}")
+
+        if inline_lines:
+            _send_ws(connection_id, {
+                "type": "delta",
+                "statusCode": 200,
+                "format": "markdown",
+                "text": "\n\n**Sources at a glance**\n" + "\n".join(inline_lines)
+            })
+
+    _send_ws(connection_id, {"type": "end", "statusCode": 200})
+
+# ---------- Handler ----------
+def lambda_handler(event, _context):
+    try:
+        connection_id = event.get("connectionId")
+        prompt = (event.get("prompt") or "").strip()
+        if not connection_id:
+            return {"statusCode": 400, "body": "Missing connectionId"}
+        if not prompt:
+            _end_with_error(connection_id, "Please provide a prompt.", 400)
+            return {"statusCode": 400, "body": "Empty prompt"}
+
+        try:
+            logger.info(f"START event meta: has_connection_id={bool(connection_id)}, prompt_len={len(prompt)}")
+        except Exception:
+            pass
+
+        _ensure_config_loaded()
+
+        # 1) Personal intercepts
+        phit = _match_personal(prompt)
+        if phit:
+            answer = phit.get("answer_template") or "Got it."
+            _send_ws(connection_id, {"type": "delta", "statusCode": 200, "format": "markdown", "text": answer})
+            _send_ws(connection_id, {"type": "end", "statusCode": 200})
+            return {"statusCode": 200, "body": "PERSONAL_KB_OK"}
+
+        # 2) Runtime routing: link-only
+        rhit = _match_runtime(prompt)
+        if rhit and rhit.get("link_only"):
+            # Link-only still streams markdown, no structured sources
+            url = (rhit.get("source_url") or "").strip()
+            name = (rhit.get("primary_source") or "Link").strip()
+            text = f"{rhit.get('answer_text') or 'Here’s the best source:'}\n\n[{name}]({url})" if url else (rhit.get('answer_text') or 'Here’s the best source.')
+            _send_ws(connection_id, {"type": "delta", "statusCode": 200, "format": "markdown", "text": text})
+            _send_ws(connection_id, {"type": "end", "statusCode": 200})
+            return {"statusCode": 200, "body": "RUNTIME_LINK_ONLY_OK"}
+
+        # 2.5) Summarization flow
+        if any(t in (prompt or "").lower() for t in (
+            "summarize", "summary of", "sum up", "tl;dr", "key findings", "key points",
+            "what are the findings", "what are the main points"
+        )):
+            history_raw = event.get("history") or []
+            history_msgs = _normalize_history_items(history_raw)
+            first_url = _extract_first_url_from_history(history_raw)
+            if not first_url:
+                _end_with_error(connection_id, "I couldn’t find a prior link to summarize. Please paste the link or ask again after I share one.", 400)
+                return {"statusCode": 400, "body": "No prior link in history"}
+            _stream_summary_from_chunks(connection_id, prompt, first_url, history_messages=history_msgs)
+            return {"statusCode": 200, "body": "SUMMARY_OK"}
+
+        # 3) COUNT flow
+        if _looks_like_count(prompt):
+            if not (_os and cfg.OPENSEARCH_INDEX and cfg.OPENSEARCH_TEXT_FIELD and cfg.OPENSEARCH_DOC_ID_FIELD and cfg.OPENSEARCH_PAGE_FIELD):
+                _end_with_error(connection_id, "Document counting is not configured.", 501)
+                return {"statusCode": 501, "body": "COUNT not configured"}
+            keyword = _extract_keyword(prompt)
+            if not keyword:
+                _end_with_error(connection_id, "I couldn't find the keyword to count. Try: how many papers mention \"cats\"?", 400)
+                return {"statusCode": 400, "body": "No keyword extracted"}
+            try:
+                summary, details_md, _ = _os_count_keyword(keyword=None)  # not used in this trimmed build
+                _send_ws(connection_id, {"type": "delta", "statusCode": 200, "format": "markdown", "text": summary + "\n\n" + details_md})
+                _send_ws(connection_id, {"type": "end", "statusCode": 200})
+                return {"statusCode": 200, "body": "COUNT OK"}
+            except Exception as e:
+                logger.error(f"COUNT error: {e}", exc_info=True)
+                _end_with_error(connection_id, "There was a problem counting documents.", 500)
+                return {"statusCode": 500, "body": "COUNT error"}
+
+        # 4) Normal talk
+        history_raw = event.get("history") or []
+        history_msgs = _normalize_history_items(history_raw)
+        try:
+            logger.info(f"History received: items={len(history_raw)}, used_text_turns={len(history_msgs)}")
+        except Exception:
+            pass
+
+        _talk_with_optional_kb(connection_id, prompt, history_messages=history_msgs)
+        return {"statusCode": 200, "body": "OK"}
+
+    except Exception as e:
+        logger.error(f"Fatal handler error: {e}", exc_info=True)
+        cid = event.get("connectionId")
+        if cid:
+            _end_with_error(cid, "Internal error.", 500)
+        return {"statusCode": 500, "body": "Internal error"}
